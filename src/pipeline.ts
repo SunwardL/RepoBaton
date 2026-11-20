@@ -84,7 +84,8 @@ export class Pipeline {
 
   // ------------------------------------------------------------------ entry points
 
-  async start(task: string): Promise<RunState> {
+  /** onCreated fires as soon as the run exists, so a caller can show it before the (long) execution ends. */
+  async start(task: string, onCreated?: (id: string) => void): Promise<RunState> {
     task = task.trim();
     if (!task) throw new PipelineError('task description is empty');
     if (!(await G.hasCommits(this.repo))) {
@@ -106,6 +107,7 @@ export class Pipeline {
     await this.openEvents(state);
     this.events.emit('run.started', task.slice(0, 120).replace(/\s+/g, ' '), { data: { task } });
     this.log.info(`run ${id}`);
+    onCreated?.(id);
     return this.execute(state);
   }
 

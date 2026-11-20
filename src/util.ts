@@ -18,15 +18,45 @@ export async function ensureDir(p: string): Promise<void> {
 }
 
 export async function readJson<T>(p: string): Promise<T> {
-  return JSON.parse(await fs.readFile(p, 'utf8')) as T;
+  // A reader can catch the file mid-replace (Windows) or momentarily empty; retry briefly.
+  let lastErr: unknown;
+  for (let i = 0; i < 8; i++) {
+    try {
+      return JSON.parse(await fs.readFile(p, 'utf8')) as T;
+    } catch (e) {
+      lastErr = e;
+      const code = (e as NodeJS.ErrnoException).code;
+      const transient = code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || e instanceof SyntaxError;
+      if (!transient) throw e;
+      await new Promise((r) => setTimeout(r, 10 * (i + 1)));
+    }
+  }
+  throw lastErr;
 }
 
-/** Atomic write so a crash never leaves a half-written state file. */
+/**
+ * Atomic write so a crash never leaves a half-written state file.
+ * On Windows, rename onto a file that another process or request has open fails
+ * with EPERM/EBUSY/EACCES; that is transient, so retry a few times.
+ */
 export async function writeFileAtomic(p: string, content: string): Promise<void> {
   await ensureDir(path.dirname(p));
-  const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${p}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   await fs.writeFile(tmp, content, 'utf8');
-  await fs.rename(tmp, p);
+  let lastErr: unknown;
+  for (let i = 0; i < 12; i++) {
+    try {
+      await fs.rename(tmp, p);
+      return;
+    } catch (e) {
+      lastErr = e;
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') break;
+      await new Promise((r) => setTimeout(r, 15 * (i + 1)));
+    }
+  }
+  await fs.rm(tmp, { force: true }).catch(() => undefined);
+  throw lastErr;
 }
 
 export async function writeJson(p: string, value: unknown): Promise<void> {
