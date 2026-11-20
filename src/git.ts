@@ -75,6 +75,31 @@ export async function branchExists(cwd: string, branch: string): Promise<boolean
   return r.trim().length > 0;
 }
 
+/**
+ * Every address `git push <remote>` writes to: pushurl when set, else url, with insteadOf and
+ * pushInsteadOf applied. It can differ from the fetch address, and there can be several.
+ */
+export async function pushUrls(cwd: string, remote: string): Promise<string[]> {
+  const out = await git(cwd, ['remote', 'get-url', '--push', '--all', remote], { allowFail: true });
+  return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+}
+
+const GH_URL = /^(?:https?|ssh|git):\/\/(?:[^/@\s]+@)?github\.com(?::\d+)?\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i;
+const GH_SCP = /^[^/@\s]+@github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i;
+const GH_PR = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/\d+\/?$/i;
+
+/** "github.com/owner/name" for an https, ssh or scp-style github.com address; null for anything else. */
+export function githubRepoOf(address: string): string | null {
+  const m = GH_URL.exec(address.trim()) ?? GH_SCP.exec(address.trim());
+  return m ? `github.com/${m[1]}/${m[2]}`.toLowerCase() : null;
+}
+
+/** "github.com/owner/name" for a github.com pull request URL, or null. */
+export function githubRepoOfPr(url: string): string | null {
+  const m = GH_PR.exec(url.trim());
+  return m ? `github.com/${m[1]}/${m[2]}`.toLowerCase() : null;
+}
+
 /** A remote address without credentials or query strings, safe to store in run state and compare later. */
 export function sanitizeRemoteUrl(url: string): string {
   return url.trim().replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]*@/i, '$1').replace(/[?#].*$/, '');
@@ -210,9 +235,9 @@ export async function ghAvailable(cwd: string): Promise<boolean> {
 
 export async function ghCreatePr(
   cwd: string,
-  o: { base: string; head: string; title: string; body: string; draft: boolean },
+  o: { repo: string; base: string; head: string; title: string; body: string; draft: boolean },
 ): Promise<string> {
-  const args = ['pr', 'create', '--base', o.base, '--head', o.head, '--title', o.title, '--body-file', '-'];
+  const args = ['pr', 'create', '--repo', o.repo, '--base', o.base, '--head', o.head, '--title', o.title, '--body-file', '-'];
   if (o.draft) args.push('--draft');
   const r = await runProcess({ command: 'gh', args, cwd, input: o.body, timeoutMs: 120_000 });
   if (r.timedOut || r.aborted) throw new GitError(`gh pr create ${r.timedOut ? 'timed out' : 'was cancelled'}; its outcome is unknown`, null);
@@ -220,7 +245,7 @@ export async function ghCreatePr(
     // An existing PR for the branch is fine: look it up instead of failing the run.
     const existing = await runProcess({
       command: 'gh',
-      args: ['pr', 'view', o.head, '--json', 'url', '--jq', '.url'],
+      args: ['pr', 'view', o.head, '--repo', o.repo, '--json', 'url', '--jq', '.url'],
       cwd,
       timeoutMs: 30_000,
     });
@@ -231,11 +256,11 @@ export async function ghCreatePr(
   return m ? m[0] : r.stdout.trim();
 }
 
-export async function ghMergePr(cwd: string, pr: string, headSha: string): Promise<void> {
+export async function ghMergePr(cwd: string, pr: string, headSha: string, repo: string): Promise<void> {
   // --match-head-commit refuses to merge if the branch moved after approval.
   const r = await runProcess({
     command: 'gh',
-    args: ['pr', 'merge', pr, '--squash', '--delete-branch', '--match-head-commit', headSha],
+    args: ['pr', 'merge', pr, '--repo', repo, '--squash', '--delete-branch', '--match-head-commit', headSha],
     cwd,
     timeoutMs: 180_000,
   });
@@ -243,14 +268,14 @@ export async function ghMergePr(cwd: string, pr: string, headSha: string): Promi
   if (r.code !== 0) throw new GitError(`gh pr merge failed: ${(r.stderr || r.stdout).trim()}`, r.code);
 }
 
-export async function ghMarkReady(cwd: string, pr: string): Promise<void> {
-  await runProcess({ command: 'gh', args: ['pr', 'ready', pr], cwd, timeoutMs: 60_000 });
+export async function ghMarkReady(cwd: string, pr: string, repo: string): Promise<void> {
+  await runProcess({ command: 'gh', args: ['pr', 'ready', pr, '--repo', repo], cwd, timeoutMs: 60_000 });
 }
 
-export async function ghMergeCommit(cwd: string, pr: string): Promise<string> {
+export async function ghMergeCommit(cwd: string, pr: string, repo: string): Promise<string> {
   const r = await runProcess({
     command: 'gh',
-    args: ['pr', 'view', pr, '--json', 'mergeCommit', '--jq', '.mergeCommit.oid'],
+    args: ['pr', 'view', pr, '--repo', repo, '--json', 'mergeCommit', '--jq', '.mergeCommit.oid'],
     cwd,
     timeoutMs: 30_000,
   });
@@ -270,7 +295,7 @@ export interface PrInfo {
   mergeCommit: string;
 }
 
-/** Read-only: the commit a branch points at on the remote, or '' when the remote has no such branch. */
+/** Read-only: the commit a branch points at on the remote (a name or an address),  or '' when the remote has no such branch. */
 export async function remoteBranchSha(cwd: string, remote: string, branch: string): Promise<string> {
   const out = await git(cwd, ['ls-remote', '--heads', remote, `refs/heads/${branch}`], { timeoutMs: 60_000 });
   return out.trim().split(/\s+/)[0] ?? '';
@@ -285,10 +310,10 @@ export async function remoteTagTarget(cwd: string, remote: string, tag: string):
 }
 
 /** Read-only: the PR for a branch or URL. null means "no such PR"; any other failure throws. */
-export async function ghPrView(cwd: string, ref: string): Promise<PrInfo | null> {
+export async function ghPrView(cwd: string, ref: string, repo: string): Promise<PrInfo | null> {
   const r = await runProcess({
     command: 'gh',
-    args: ['pr', 'view', ref, '--json', 'url,state,headRefOid,mergeCommit'],
+    args: ['pr', 'view', ref, '--repo', repo, '--json', 'url,state,headRefOid,mergeCommit'],
     cwd,
     timeoutMs: 30_000,
   });
@@ -314,17 +339,17 @@ export interface RemoteOps {
   pushTag(cwd: string, remote: string, tag: string): Promise<void>;
   fetchRemote(cwd: string, remote: string): Promise<void>;
   ghAvailable(cwd: string): Promise<boolean>;
-  ghCreatePr(cwd: string, o: { base: string; head: string; title: string; body: string; draft: boolean }): Promise<string>;
-  ghMarkReady(cwd: string, pr: string): Promise<void>;
-  ghMergePr(cwd: string, pr: string, headSha: string): Promise<void>;
-  ghMergeCommit(cwd: string, pr: string): Promise<string>;
-  /** Read-only: the address configured for a remote (credentials included; sanitize before storing), or null. */
-  remoteUrl(cwd: string, remote: string): Promise<string | null>;
+  ghCreatePr(cwd: string, o: { repo: string; base: string; head: string; title: string; body: string; draft: boolean }): Promise<string>;
+  ghMarkReady(cwd: string, pr: string, repo: string): Promise<void>;
+  ghMergePr(cwd: string, pr: string, headSha: string, repo: string): Promise<void>;
+  ghMergeCommit(cwd: string, pr: string, repo: string): Promise<string>;
+  /** Read-only: the addresses a push to this remote writes to (credentials may be included; sanitize before storing). */
+  pushUrls(cwd: string, remote: string): Promise<string[]>;
   remoteBranchSha(cwd: string, remote: string, branch: string): Promise<string>;
   remoteTagTarget(cwd: string, remote: string, tag: string): Promise<string>;
-  ghPrView(cwd: string, ref: string): Promise<PrInfo | null>;
+  ghPrView(cwd: string, ref: string, repo: string): Promise<PrInfo | null>;
 }
 
 export const realRemoteOps: RemoteOps = {
-  push, pushTag, fetchRemote, ghAvailable, ghCreatePr, ghMarkReady, ghMergePr, ghMergeCommit, remoteUrl, remoteBranchSha, remoteTagTarget, ghPrView,
+  push, pushTag, fetchRemote, ghAvailable, ghCreatePr, ghMarkReady, ghMergePr, ghMergeCommit, pushUrls, remoteBranchSha, remoteTagTarget, ghPrView,
 };

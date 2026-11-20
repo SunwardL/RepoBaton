@@ -30,7 +30,12 @@ export interface CheckContext {
   ops: G.RemoteOps;
   /** Main working tree, where git and gh can run. */
   repo: string;
+  /** Name of the remote the operation was aimed at (set from the run's recorded target). */
   remote: string;
+  /** Where that remote's pushes go, as git reads it now. Read-only queries use this address, not the remote's name. */
+  address?: string;
+  /** The GitHub repository (github.com/owner/name) recorded for PR steps. */
+  githubRepo?: string;
   branch: string;
   approvedSha: string;
 }
@@ -46,14 +51,23 @@ const PR_URL = /^https:\/\/[^\s/]+\/[^\s]+\/pull\/\d+\/?$/;
 export async function checkInFlight(state: RunState, ctx: CheckContext): Promise<Verdict> {
   const op = state.publish.inFlight;
   if (!op) return { outcome: 'unknown', reason: 'no operation is marked as in flight' };
-  // The check must look at the remote the operation was aimed at, not at whatever is configured now.
-  const rec = state.publish.inFlightRemote;
-  if (!rec) return { outcome: 'unknown', reason: 'the run did not record which remote the interrupted operation was aimed at, so the current configuration cannot be trusted to be the same one' };
-  const now = G.sanitizeRemoteUrl((await ctx.ops.remoteUrl(ctx.repo, rec.name).catch(() => null)) ?? '');
-  if (now !== rec.url) {
-    return { outcome: 'conflict', reason: `remote "${rec.name}" pointed at ${rec.url || '(no address)'} when the operation started but is ${now ? `now ${now}` : 'no longer configured'}, so it cannot be checked against the original remote` };
+  // The check must look at the place the operation wrote to, not at whatever is configured now.
+  const rec = state.publish.inFlightTarget;
+  if (!rec) return { outcome: 'unknown', reason: 'the run did not record where the interrupted operation was writing, so the current configuration cannot be trusted to be the same place' };
+  let urls: string[];
+  try {
+    urls = await ctx.ops.pushUrls(ctx.repo, rec.remote);
+  } catch (e) {
+    return { outcome: 'unknown', reason: `the push address of remote "${rec.remote}" could not be read: ${(e as Error).message}` };
   }
-  ctx = { ...ctx, remote: rec.name };
+  if (urls.length > 1) {
+    return { outcome: 'conflict', reason: `remote "${rec.remote}" now has ${urls.length} push addresses (${urls.map(G.sanitizeRemoteUrl).join(', ')}); it pushed to ${rec.url || '(no address)'} when the operation started` };
+  }
+  const now = G.sanitizeRemoteUrl(urls[0] ?? '');
+  if (!now || now !== rec.url) {
+    return { outcome: 'conflict', reason: `remote "${rec.remote}" pushed to ${rec.url || '(no address)'} when the operation started but ${now ? `now pushes to ${now}` : 'is no longer configured'}, so it cannot be checked against the original target` };
+  }
+  ctx = { ...ctx, remote: rec.remote, address: urls[0], githubRepo: rec.githubRepo };
   try {
     switch (op) {
       case 'push':
@@ -72,7 +86,7 @@ export async function checkInFlight(state: RunState, ctx: CheckContext): Promise
 }
 
 async function checkPush(ctx: CheckContext): Promise<Verdict> {
-  const sha = await ctx.ops.remoteBranchSha(ctx.repo, ctx.remote, ctx.branch);
+  const sha = await ctx.ops.remoteBranchSha(ctx.repo, ctx.address ?? ctx.remote, ctx.branch);
   if (sha === ctx.approvedSha) {
     return { outcome: 'done', summary: `branch ${ctx.branch} is on ${ctx.remote} at the approved commit`, apply: (p) => void (p.pushed = true) };
   }
@@ -80,9 +94,19 @@ async function checkPush(ctx: CheckContext): Promise<Verdict> {
   return { outcome: 'conflict', reason: `${ctx.remote}/${ctx.branch} is at ${sha.slice(0, 8)}, not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
 }
 
+/** A PR view must name the recorded repository: the answer of another one is a conflict, not a gap. */
+function prElsewhere(ctx: CheckContext, pr: G.PrInfo): Verdict | null {
+  return G.githubRepoOfPr(pr.url) === ctx.githubRepo
+    ? null
+    : { outcome: 'conflict', reason: `the pull request ${pr.url} is not in ${ctx.githubRepo}, the repository this run writes to` };
+}
+
 async function checkPr(ctx: CheckContext): Promise<Verdict> {
-  const pr = await ctx.ops.ghPrView(ctx.repo, ctx.branch);
-  if (!pr) return { outcome: 'not-done', summary: `no pull request exists for ${ctx.branch}` };
+  if (!ctx.githubRepo) return { outcome: 'unknown', reason: 'the GitHub repository of the pull request was not recorded' };
+  const pr = await ctx.ops.ghPrView(ctx.repo, ctx.branch, ctx.githubRepo);
+  if (!pr) return { outcome: 'not-done', summary: `no pull request exists for ${ctx.branch} in ${ctx.githubRepo}` };
+  const elsewhere = prElsewhere(ctx, pr);
+  if (elsewhere) return elsewhere;
   if (pr.headSha !== ctx.approvedSha) {
     return { outcome: 'conflict', reason: `a pull request exists (${pr.url}) but its head ${pr.headSha.slice(0, 8)} is not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
   }
@@ -102,9 +126,15 @@ async function checkPr(ctx: CheckContext): Promise<Verdict> {
 }
 
 async function checkMerge(state: RunState, ctx: CheckContext): Promise<Verdict> {
+  if (!ctx.githubRepo) return { outcome: 'unknown', reason: 'the GitHub repository of the pull request was not recorded' };
   const ref = state.publish.prUrl ?? ctx.branch;
-  const pr = await ctx.ops.ghPrView(ctx.repo, ref);
+  if (state.publish.prUrl && G.githubRepoOfPr(state.publish.prUrl) !== ctx.githubRepo) {
+    return { outcome: 'conflict', reason: `the recorded pull request ${state.publish.prUrl} is not in ${ctx.githubRepo}, the repository this run writes to` };
+  }
+  const pr = await ctx.ops.ghPrView(ctx.repo, ref, ctx.githubRepo);
   if (!pr) return { outcome: 'unknown', reason: `the pull request ${ref} could not be found` };
+  const elsewhere = prElsewhere(ctx, pr);
+  if (elsewhere) return elsewhere;
   if (pr.headSha !== ctx.approvedSha) {
     return { outcome: 'conflict', reason: `${pr.url} has head ${pr.headSha.slice(0, 8)}, not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
   }
@@ -127,7 +157,7 @@ async function checkTag(state: RunState, ctx: CheckContext): Promise<Verdict> {
   const tag = state.publish.pendingTag;
   const target = state.publish.mergeSha;
   if (!tag || !target) return { outcome: 'unknown', reason: 'the tag name or the commit it should point at was not recorded' };
-  const remote = await ctx.ops.remoteTagTarget(ctx.repo, ctx.remote, tag);
+  const remote = await ctx.ops.remoteTagTarget(ctx.repo, ctx.address ?? ctx.remote, tag);
   if (remote) {
     if (remote === target) {
       return {

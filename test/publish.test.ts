@@ -17,7 +17,8 @@ import type { Agent, AgentResult, AgentRunRequest, Config, RunState } from '../s
 const APPROVED = 'a'.repeat(40);
 const MERGED = 'b'.repeat(40);
 const OTHER = 'c'.repeat(40);
-const REMOTE_URL = 'https://example.invalid/o/r.git';
+const REMOTE_URL = 'https://github.com/o/r.git';
+const GH_REPO = 'github.com/o/r';
 
 /** A fake remote + GitHub. Records every call; nothing leaves the process. */
 class FakeRemote implements RemoteOps {
@@ -27,10 +28,12 @@ class FakeRemote implements RemoteOps {
   pr: PrInfo | null = null;
   fail: Record<string, string> = {};
   hang = new Set<string>();
-  /** Address of every remote name; "origin" matches the one approvedRun configures. */
-  urls: Record<string, string> = { origin: REMOTE_URL };
-  /** Remote names the read-only checks were pointed at. */
+  /** Where a push to each remote name writes; "origin" matches the one approvedRun configures. */
+  pushes: Record<string, string[]> = { origin: [REMOTE_URL] };
+  /** Addresses the read-only ls-remote checks were pointed at. */
   queried: string[] = [];
+  /** The GitHub repository every gh call was told to use. */
+  ghRepos: string[] = [];
   private count(name: string): void {
     this.calls.push(name);
     if (this.fail[name]) throw new Error(this.fail[name]);
@@ -51,23 +54,28 @@ class FakeRemote implements RemoteOps {
   async ghAvailable(): Promise<boolean> {
     return true;
   }
-  async ghCreatePr(): Promise<string> {
+  async ghCreatePr(_cwd: string, o: { repo: string }): Promise<string> {
+    this.ghRepos.push(o.repo);
     this.count('createPr');
     this.pr = { url: 'https://github.com/o/r/pull/7', state: 'OPEN', headSha: APPROVED, mergeCommit: '' };
     return this.pr.url;
   }
-  async ghMarkReady(): Promise<void> {
+  async ghMarkReady(_cwd: string, _pr: string, repo: string): Promise<void> {
+    this.ghRepos.push(repo);
     this.count('ready');
   }
-  async ghMergePr(): Promise<void> {
+  async ghMergePr(_cwd: string, _pr: string, _sha: string, repo: string): Promise<void> {
+    this.ghRepos.push(repo);
     this.count('merge');
     if (this.pr) this.pr = { ...this.pr, state: 'MERGED', mergeCommit: MERGED };
   }
-  async ghMergeCommit(): Promise<string> {
+  async ghMergeCommit(_cwd: string, _pr: string, repo: string): Promise<string> {
+    this.ghRepos.push(repo);
     return this.pr?.mergeCommit ?? '';
   }
-  async remoteUrl(_cwd: string, remote: string): Promise<string | null> {
-    return this.urls[remote] ?? null;
+  async pushUrls(_cwd: string, remote: string): Promise<string[]> {
+    if (this.fail.pushUrls) throw new Error(this.fail.pushUrls);
+    return this.pushes[remote] ?? [];
   }
   async remoteBranchSha(_cwd: string, remote: string): Promise<string> {
     this.queried.push(remote);
@@ -81,7 +89,8 @@ class FakeRemote implements RemoteOps {
     if (this.fail.lsTag) throw new Error(this.fail.lsTag);
     return this.tagSha;
   }
-  async ghPrView(): Promise<PrInfo | null> {
+  async ghPrView(_cwd: string, _ref: string, repo: string): Promise<PrInfo | null> {
+    this.ghRepos.push(repo);
     this.calls.push('prView');
     if (this.fail.prView) throw new Error(this.fail.prView);
     return this.pr;
@@ -89,8 +98,8 @@ class FakeRemote implements RemoteOps {
 }
 
 function stateWith(publish: RunState['publish'], over: Partial<RunState> = {}): RunState {
-  // A marker written by the pipeline always carries the remote it was aimed at.
-  if (publish.inFlight && !publish.inFlightRemote) publish = { ...publish, inFlightRemote: { name: 'origin', url: REMOTE_URL } };
+  // A marker written by the pipeline always carries the place it was aimed at.
+  if (publish.inFlight && !publish.inFlightTarget) publish = { ...publish, inFlightTarget: { remote: 'origin', url: REMOTE_URL.replace(/\.git$/, '.git'), githubRepo: GH_REPO } };
   return {
     id: 'r1',
     task: 't',
@@ -313,7 +322,7 @@ async function approvedRun(publish: Partial<Config['publish']>, seed: Partial<Ru
   const base = (await git(repo, ['rev-parse', 'HEAD'])).trim();
   // A configured URL so the pipeline's "is there a remote?" check passes; it is never contacted:
   // every remote operation goes through the fake.
-  await git(repo, ['remote', 'add', 'origin', 'https://example.invalid/o/r.git']);
+  await git(repo, ['remote', 'add', 'origin', REMOTE_URL]);
   await git(repo, ['worktree', 'add', '-q', '-b', 'repobaton/x', path.join(repo, '.repobaton', 'wt'), base]);
   const wt = path.join(repo, '.repobaton', 'wt');
   await fs.writeFile(path.join(wt, 'v.txt'), 'good\n');
@@ -547,14 +556,14 @@ test('server: a check cannot run while the repository is executing something els
 
 test('a remote that changed since the interruption is never queried, and no claim or evidence overrides that', async () => {
   const ops = new FakeRemote();
-  ops.urls.origin = 'https://example.invalid/someone/else.git'; // same name, different repository
+  ops.pushes.origin = ['https://github.com/someone/else.git']; // same name, different repository
   ops.branchSha = ''; // the other repository has no such branch: reading it as "not pushed" would be wrong
   for (const claim of [{ completed: false }, { completed: true }, { completed: true, evidence: { remoteSha: APPROVED } }]) {
     const s = stateWith({ inFlight: 'push' });
     const r = await acknowledgePublish(s, ctx(ops), claim);
     assert.ok(!r.ok && r.code === 'contradicts-remote', JSON.stringify(r));
-    assert.ok((r as any).message.includes('https://example.invalid/o/r.git'), 'names the address recorded at interruption');
-    assert.ok((r as any).message.includes('https://example.invalid/someone/else.git'), 'and the one configured now');
+    assert.ok((r as any).message.includes('https://github.com/o/r.git'), 'names the address recorded at interruption');
+    assert.ok((r as any).message.includes('https://github.com/someone/else.git'), 'and the one configured now');
     assert.equal(s.publish.inFlight, 'push', 'the marker stays');
     assert.equal(s.publish.pushed, undefined);
   }
@@ -564,7 +573,7 @@ test('a remote that changed since the interruption is never queried, and no clai
 
 test('a remote that was removed or renamed since the interruption keeps the run paused', async () => {
   const ops = new FakeRemote();
-  delete ops.urls.origin;
+  delete ops.pushes.origin;
   const s = stateWith({ inFlight: 'push' });
   const r = await acknowledgePublish(s, ctx(ops), { completed: false });
   assert.ok(!r.ok && r.code === 'contradicts-remote');
@@ -574,19 +583,19 @@ test('a remote that was removed or renamed since the interruption keeps the run 
 
 test('the check uses the remote recorded at interruption, not the one named in the current configuration', async () => {
   const ops = new FakeRemote();
-  ops.urls.upstream = 'https://example.invalid/o/up.git';
+  ops.pushes.upstream = ['https://github.com/o/up.git'];
   ops.branchSha = APPROVED;
-  const s = stateWith({ inFlight: 'push', inFlightRemote: { name: 'upstream', url: 'https://example.invalid/o/up.git' } });
+  const s = stateWith({ inFlight: 'push', inFlightTarget: { remote: 'upstream', url: 'https://github.com/o/up.git' } });
   const r = await acknowledgePublish(s, { ...ctx(ops), remote: 'origin' }, { completed: false });
   assert.ok(r.ok && r.recorded === 'done', JSON.stringify(r));
-  assert.deepEqual(ops.queried, ['upstream']);
+  assert.deepEqual(ops.queried, ['https://github.com/o/up.git'], 'asked at the push address itself');
 });
 
 test('a marker without a recorded remote cannot be settled by looking at the current configuration', async () => {
   const ops = new FakeRemote();
   ops.branchSha = APPROVED;
   const s = stateWith({ inFlight: 'push' });
-  s.publish.inFlightRemote = undefined;
+  s.publish.inFlightTarget = undefined;
   const r = await acknowledgePublish(s, ctx(ops), { completed: false });
   assert.ok(!r.ok && r.code === 'unconfirmed');
   assert.equal(ops.queried.length, 0);

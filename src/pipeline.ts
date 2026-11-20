@@ -681,11 +681,36 @@ export class Pipeline {
   }
 
   /** Record, on disk, that an external operation is about to start. */
-  private async markInFlight(state: RunState, op: NonNullable<RunState['publish']['inFlight']>): Promise<void> {
+  private async markInFlight(state: RunState, op: NonNullable<RunState['publish']['inFlight']>, target: NonNullable<RunState['publish']['inFlightTarget']>): Promise<void> {
     state.publish.inFlight = op;
-    const remoteName = this.cfg.publish.remote;
-    state.publish.inFlightRemote = { name: remoteName, url: G.sanitizeRemoteUrl((await this.ops.remoteUrl(this.repo, remoteName)) ?? '') };
+    state.publish.inFlightTarget = target;
     await this.store.save(state);
+  }
+
+  /**
+   * The place a push, tag or PR step really writes to. `git push <remote>` goes to the push
+   * address (pushurl, insteadOf rules applied), which can differ from the address used for
+   * reading, and `gh` must be told the repository instead of guessing it from the directory.
+   * Several push addresses, or a PR on an address that is not github.com, cannot be tied to one
+   * target, so the run stops before doing anything.
+   */
+  private async writeTarget(needsGithubRepo: boolean): Promise<NonNullable<RunState['publish']['inFlightTarget']>> {
+    const remote = this.cfg.publish.remote;
+    const urls = await this.ops.pushUrls(this.repo, remote);
+    if (urls.length === 0) throw new PipelineError(`remote "${remote}" is not configured`, 'needs-human');
+    if (urls.length > 1) {
+      throw new PipelineError(
+        `remote "${remote}" has ${urls.length} push addresses (${urls.map(G.sanitizeRemoteUrl).join(', ')}); a push would write to all of them and an interrupted one could not be checked reliably. Configure a single push address.`,
+        'needs-human',
+      );
+    }
+    const url = G.sanitizeRemoteUrl(urls[0]);
+    if (!needsGithubRepo) return { remote, url };
+    const githubRepo = G.githubRepoOf(urls[0]);
+    if (!githubRepo) {
+      throw new PipelineError(`remote "${remote}" pushes to ${url}, which is not a github.com address, so the pull request repository cannot be identified`, 'needs-human');
+    }
+    return { remote, url, githubRepo };
   }
 
   private async publish(state: RunState, approvedSha: string): Promise<void> {
@@ -720,8 +745,7 @@ export class Pipeline {
     const rel = state.release!;
 
     if (p.push && !state.publish.pushed) {
-      if (!(await G.remoteUrl(this.repo, p.remote))) throw new PipelineError(`remote "${p.remote}" is not configured`, 'needs-human');
-      await this.markInFlight(state, 'push');
+      await this.markInFlight(state, 'push', await this.writeTarget(false));
       await this.ops.push(wt, p.remote, branch);
       state.publish.inFlight = undefined;
       state.publish.pushed = true;
@@ -730,26 +754,37 @@ export class Pipeline {
     }
     if (p.createPr && !state.publish.prUrl) {
       if (!(await this.ops.ghAvailable(wt))) throw new PipelineError('publish.createPr needs the GitHub CLI ("gh") installed and logged in', 'needs-human');
-      await this.markInFlight(state, 'pr');
-      state.publish.prUrl = await this.ops.ghCreatePr(wt, {
+      const target = await this.writeTarget(true);
+      await this.markInFlight(state, 'pr', target);
+      const created = await this.ops.ghCreatePr(wt, {
+        repo: target.githubRepo!,
         base: state.base!.branch,
         head: branch,
         title: rel.pr_title,
         body: rel.pr_body,
         draft: p.draftPr && !p.merge,
       });
+      // The marker stays set when the PR is somewhere else: nothing can be recorded safely.
+      if (G.githubRepoOfPr(created) !== target.githubRepo) {
+        throw new PipelineError(`the pull request ${created} is not in ${target.githubRepo}, the repository this run pushes to`, 'needs-human');
+      }
+      state.publish.prUrl = created;
       state.publish.inFlight = undefined;
       this.log.stage('publish', `PR ${state.publish.prUrl}`);
       await this.store.save(state);
     }
     if (p.merge && !state.publish.merged) {
       const pr = state.publish.prUrl!;
-      await this.markInFlight(state, 'merge');
-      await this.ops.ghMarkReady(wt, pr);
-      await this.ops.ghMergePr(wt, pr, approvedSha);
+      const target = await this.writeTarget(true);
+      if (G.githubRepoOfPr(pr) !== target.githubRepo) {
+        throw new PipelineError(`the pull request ${pr} is not in ${target.githubRepo}, the repository this run pushes to; refusing to merge it`, 'needs-human');
+      }
+      await this.markInFlight(state, 'merge', target);
+      await this.ops.ghMarkReady(wt, pr, target.githubRepo!);
+      await this.ops.ghMergePr(wt, pr, approvedSha, target.githubRepo!);
       state.publish.inFlight = undefined;
       state.publish.merged = true;
-      state.publish.mergeSha = (await this.ops.ghMergeCommit(wt, pr)) || undefined;
+      state.publish.mergeSha = (await this.ops.ghMergeCommit(wt, pr, target.githubRepo!)) || undefined;
       this.log.stage('publish', `merged ${pr}`);
       await this.store.save(state);
     }
@@ -771,8 +806,9 @@ export class Pipeline {
     await this.ops.fetchRemote(root, p.remote);
     const sha = state.publish.mergeSha;
     if (!sha) throw new PipelineError('cannot tag: merge commit is unknown', 'needs-human');
+    const target = await this.writeTarget(false);
     state.publish.pendingTag = tag;
-    await this.markInFlight(state, 'tag');
+    await this.markInFlight(state, 'tag', target);
     // A tag that already exists locally at the merge commit (an earlier attempt got that far) is reused.
     if ((await G.tagTarget(root, tag)) !== sha) await G.createTag(root, tag, sha, rel.release_notes || tag);
     state.publish.tag = tag;

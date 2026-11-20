@@ -244,8 +244,13 @@ export interface PublishState {
   inFlight?: 'push' | 'pr' | 'merge' | 'tag';
   /** The tag name, recorded before the tag operation starts, so recovery knows which tag to look for. */
   pendingTag?: string;
-  /** The remote (name and credential-free address) the in-flight operation was aimed at, so recovery checks that same remote even if the configuration changes later. */
-  inFlightRemote?: { name: string; url: string };
+  /**
+   * Where the in-flight operation actually writes, so recovery checks that same place even if
+   * the configuration changes later: the remote name, its push address without credentials
+   * (the fetch address can differ), and for PR steps the GitHub repository. Runs without it
+   * (older records) are never matched against the current configuration.
+   */
+  inFlightTarget?: { remote: string; url: string; githubRepo?: string };
 }
 
 export interface RunState {
