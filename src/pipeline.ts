@@ -683,6 +683,8 @@ export class Pipeline {
   /** Record, on disk, that an external operation is about to start. */
   private async markInFlight(state: RunState, op: NonNullable<RunState['publish']['inFlight']>): Promise<void> {
     state.publish.inFlight = op;
+    const remoteName = this.cfg.publish.remote;
+    state.publish.inFlightRemote = { name: remoteName, url: G.sanitizeRemoteUrl((await this.ops.remoteUrl(this.repo, remoteName)) ?? '') };
     await this.store.save(state);
   }
 

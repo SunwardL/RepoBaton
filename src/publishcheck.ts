@@ -22,7 +22,9 @@ export type Verdict =
   /** The remote shows it did not happen (or only partly): safe to run it again. */
   | { outcome: 'not-done'; summary: string; apply?: (p: PublishState) => void }
   /** Cannot tell. The run must stay paused. */
-  | { outcome: 'unknown'; reason: string };
+  | { outcome: 'unknown'; reason: string }
+  /** The remote shows something that contradicts the record (another commit, another remote). A claim by hand never overrides it. */
+  | { outcome: 'conflict'; reason: string };
 
 export interface CheckContext {
   ops: G.RemoteOps;
@@ -44,6 +46,14 @@ const PR_URL = /^https:\/\/[^\s/]+\/[^\s]+\/pull\/\d+\/?$/;
 export async function checkInFlight(state: RunState, ctx: CheckContext): Promise<Verdict> {
   const op = state.publish.inFlight;
   if (!op) return { outcome: 'unknown', reason: 'no operation is marked as in flight' };
+  // The check must look at the remote the operation was aimed at, not at whatever is configured now.
+  const rec = state.publish.inFlightRemote;
+  if (!rec) return { outcome: 'unknown', reason: 'the run did not record which remote the interrupted operation was aimed at, so the current configuration cannot be trusted to be the same one' };
+  const now = G.sanitizeRemoteUrl((await ctx.ops.remoteUrl(ctx.repo, rec.name).catch(() => null)) ?? '');
+  if (now !== rec.url) {
+    return { outcome: 'conflict', reason: `remote "${rec.name}" pointed at ${rec.url || '(no address)'} when the operation started but is ${now ? `now ${now}` : 'no longer configured'}, so it cannot be checked against the original remote` };
+  }
+  ctx = { ...ctx, remote: rec.name };
   try {
     switch (op) {
       case 'push':
@@ -67,14 +77,14 @@ async function checkPush(ctx: CheckContext): Promise<Verdict> {
     return { outcome: 'done', summary: `branch ${ctx.branch} is on ${ctx.remote} at the approved commit`, apply: (p) => void (p.pushed = true) };
   }
   if (!sha) return { outcome: 'not-done', summary: `branch ${ctx.branch} is not on ${ctx.remote}` };
-  return { outcome: 'unknown', reason: `${ctx.remote}/${ctx.branch} is at ${sha.slice(0, 8)}, not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
+  return { outcome: 'conflict', reason: `${ctx.remote}/${ctx.branch} is at ${sha.slice(0, 8)}, not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
 }
 
 async function checkPr(ctx: CheckContext): Promise<Verdict> {
   const pr = await ctx.ops.ghPrView(ctx.repo, ctx.branch);
   if (!pr) return { outcome: 'not-done', summary: `no pull request exists for ${ctx.branch}` };
   if (pr.headSha !== ctx.approvedSha) {
-    return { outcome: 'unknown', reason: `a pull request exists (${pr.url}) but its head ${pr.headSha.slice(0, 8)} is not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
+    return { outcome: 'conflict', reason: `a pull request exists (${pr.url}) but its head ${pr.headSha.slice(0, 8)} is not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
   }
   if (pr.state === 'CLOSED') return { outcome: 'unknown', reason: `the pull request ${pr.url} was closed without merging` };
   if (pr.state === 'MERGED' && !pr.mergeCommit) return { outcome: 'unknown', reason: `${pr.url} is merged but its merge commit could not be read` };
@@ -96,7 +106,7 @@ async function checkMerge(state: RunState, ctx: CheckContext): Promise<Verdict> 
   const pr = await ctx.ops.ghPrView(ctx.repo, ref);
   if (!pr) return { outcome: 'unknown', reason: `the pull request ${ref} could not be found` };
   if (pr.headSha !== ctx.approvedSha) {
-    return { outcome: 'unknown', reason: `${pr.url} has head ${pr.headSha.slice(0, 8)}, not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
+    return { outcome: 'conflict', reason: `${pr.url} has head ${pr.headSha.slice(0, 8)}, not the approved commit ${ctx.approvedSha.slice(0, 8)}` };
   }
   if (pr.state === 'MERGED') {
     if (!FULL_SHA.test(pr.mergeCommit)) return { outcome: 'unknown', reason: `${pr.url} is merged but its merge commit could not be read` };
@@ -129,7 +139,7 @@ async function checkTag(state: RunState, ctx: CheckContext): Promise<Verdict> {
         },
       };
     }
-    return { outcome: 'unknown', reason: `tag ${tag} exists on ${ctx.remote} but points at ${remote.slice(0, 8)}, not the merge commit ${target.slice(0, 8)}` };
+    return { outcome: 'conflict', reason: `tag ${tag} exists on ${ctx.remote} but points at ${remote.slice(0, 8)}, not the merge commit ${target.slice(0, 8)}` };
   }
   const local = await G.tagTarget(ctx.repo, tag);
   if (!local) return { outcome: 'not-done', summary: `tag ${tag} exists neither locally nor on ${ctx.remote}` };
@@ -137,7 +147,7 @@ async function checkTag(state: RunState, ctx: CheckContext): Promise<Verdict> {
     // Created locally, never pushed: only the push is left.
     return { outcome: 'not-done', summary: `tag ${tag} exists locally but was not pushed`, apply: (p) => void (p.tag = tag) };
   }
-  return { outcome: 'unknown', reason: `a local tag ${tag} exists but points at ${local.slice(0, 8)}, not the merge commit ${target.slice(0, 8)}` };
+  return { outcome: 'conflict', reason: `a local tag ${tag} exists but points at ${local.slice(0, 8)}, not the merge commit ${target.slice(0, 8)}` };
 }
 
 // ------------------------------------------------------------------ manual acknowledgement
@@ -235,6 +245,14 @@ export async function acknowledgePublish(state: RunState, ctx: CheckContext, raw
       };
     }
     return finish(verdict);
+  }
+  if (verdict.outcome === 'conflict') {
+    // The remote shows something different from what was approved or recorded; a claim from the user does not settle that.
+    return {
+      ok: false,
+      code: 'contradicts-remote',
+      message: `The remote contradicts the record for "${op}": ${verdict.reason}. Recording it by hand would hide the conflict, so the run stays paused. Resolve the difference on the remote, then check again.`,
+    };
   }
   // unknown: the remote cannot settle it.
   if (claim.completed) {

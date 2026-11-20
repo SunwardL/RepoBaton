@@ -244,6 +244,8 @@ export interface PublishState {
   inFlight?: 'push' | 'pr' | 'merge' | 'tag';
   /** The tag name, recorded before the tag operation starts, so recovery knows which tag to look for. */
   pendingTag?: string;
+  /** The remote (name and credential-free address) the in-flight operation was aimed at, so recovery checks that same remote even if the configuration changes later. */
+  inFlightRemote?: { name: string; url: string };
 }
 
 export interface RunState {

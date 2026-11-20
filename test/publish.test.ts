@@ -17,6 +17,7 @@ import type { Agent, AgentResult, AgentRunRequest, Config, RunState } from '../s
 const APPROVED = 'a'.repeat(40);
 const MERGED = 'b'.repeat(40);
 const OTHER = 'c'.repeat(40);
+const REMOTE_URL = 'https://example.invalid/o/r.git';
 
 /** A fake remote + GitHub. Records every call; nothing leaves the process. */
 class FakeRemote implements RemoteOps {
@@ -26,6 +27,10 @@ class FakeRemote implements RemoteOps {
   pr: PrInfo | null = null;
   fail: Record<string, string> = {};
   hang = new Set<string>();
+  /** Address of every remote name; "origin" matches the one approvedRun configures. */
+  urls: Record<string, string> = { origin: REMOTE_URL };
+  /** Remote names the read-only checks were pointed at. */
+  queried: string[] = [];
   private count(name: string): void {
     this.calls.push(name);
     if (this.fail[name]) throw new Error(this.fail[name]);
@@ -61,12 +66,17 @@ class FakeRemote implements RemoteOps {
   async ghMergeCommit(): Promise<string> {
     return this.pr?.mergeCommit ?? '';
   }
-  async remoteBranchSha(): Promise<string> {
+  async remoteUrl(_cwd: string, remote: string): Promise<string | null> {
+    return this.urls[remote] ?? null;
+  }
+  async remoteBranchSha(_cwd: string, remote: string): Promise<string> {
+    this.queried.push(remote);
     this.calls.push('lsBranch');
     if (this.fail.lsBranch) throw new Error(this.fail.lsBranch);
     return this.branchSha;
   }
-  async remoteTagTarget(): Promise<string> {
+  async remoteTagTarget(_cwd: string, remote: string): Promise<string> {
+    this.queried.push(remote);
     this.calls.push('lsTag');
     if (this.fail.lsTag) throw new Error(this.fail.lsTag);
     return this.tagSha;
@@ -79,6 +89,8 @@ class FakeRemote implements RemoteOps {
 }
 
 function stateWith(publish: RunState['publish'], over: Partial<RunState> = {}): RunState {
+  // A marker written by the pipeline always carries the remote it was aimed at.
+  if (publish.inFlight && !publish.inFlightRemote) publish = { ...publish, inFlightRemote: { name: 'origin', url: REMOTE_URL } };
   return {
     id: 'r1',
     task: 't',
@@ -130,7 +142,7 @@ test('push: remote branch at a different commit, or an unreachable remote, keeps
   ops.branchSha = OTHER;
   const a = stateWith({ inFlight: 'push' });
   const r1 = await acknowledgePublish(a, ctx(ops), { completed: false });
-  assert.ok(!r1.ok && r1.code === 'unconfirmed');
+  assert.ok(!r1.ok && r1.code === 'contradicts-remote', 'a branch found at another commit is a conflict, not a gap');
   assert.equal(a.publish.inFlight, 'push');
 
   const down = new FakeRemote();
@@ -277,7 +289,7 @@ test('tag: a local tag at another commit is never accepted as "did not happen"',
   const repo = await repoWithTag('v1.0.1', MERGED); // points at the repo HEAD, not MERGED
   const s = stateWith({ inFlight: 'tag', pendingTag: 'v1.0.1', mergeSha: MERGED, merged: true });
   const r = await acknowledgePublish(s, { ...ctx(new FakeRemote()), repo }, { completed: false });
-  assert.ok(!r.ok && r.code === 'unconfirmed');
+  assert.ok(!r.ok && r.code === 'contradicts-remote');
   assert.equal(s.publish.inFlight, 'tag');
 });
 
@@ -529,4 +541,106 @@ test('server: a check cannot run while the repository is executing something els
     release();
     await srv.close();
   }
+});
+
+// ------------------------------------------------------------------ the remote the operation was aimed at
+
+test('a remote that changed since the interruption is never queried, and no claim or evidence overrides that', async () => {
+  const ops = new FakeRemote();
+  ops.urls.origin = 'https://example.invalid/someone/else.git'; // same name, different repository
+  ops.branchSha = ''; // the other repository has no such branch: reading it as "not pushed" would be wrong
+  for (const claim of [{ completed: false }, { completed: true }, { completed: true, evidence: { remoteSha: APPROVED } }]) {
+    const s = stateWith({ inFlight: 'push' });
+    const r = await acknowledgePublish(s, ctx(ops), claim);
+    assert.ok(!r.ok && r.code === 'contradicts-remote', JSON.stringify(r));
+    assert.ok((r as any).message.includes('https://example.invalid/o/r.git'), 'names the address recorded at interruption');
+    assert.ok((r as any).message.includes('https://example.invalid/someone/else.git'), 'and the one configured now');
+    assert.equal(s.publish.inFlight, 'push', 'the marker stays');
+    assert.equal(s.publish.pushed, undefined);
+  }
+  assert.deepEqual(ops.queried, [], 'the changed remote was not asked about the branch');
+  assert.equal(ops.n('prView'), 0);
+});
+
+test('a remote that was removed or renamed since the interruption keeps the run paused', async () => {
+  const ops = new FakeRemote();
+  delete ops.urls.origin;
+  const s = stateWith({ inFlight: 'push' });
+  const r = await acknowledgePublish(s, ctx(ops), { completed: false });
+  assert.ok(!r.ok && r.code === 'contradicts-remote');
+  assert.match((r as any).message, /no longer configured/);
+  assert.equal(s.publish.inFlight, 'push');
+});
+
+test('the check uses the remote recorded at interruption, not the one named in the current configuration', async () => {
+  const ops = new FakeRemote();
+  ops.urls.upstream = 'https://example.invalid/o/up.git';
+  ops.branchSha = APPROVED;
+  const s = stateWith({ inFlight: 'push', inFlightRemote: { name: 'upstream', url: 'https://example.invalid/o/up.git' } });
+  const r = await acknowledgePublish(s, { ...ctx(ops), remote: 'origin' }, { completed: false });
+  assert.ok(r.ok && r.recorded === 'done', JSON.stringify(r));
+  assert.deepEqual(ops.queried, ['upstream']);
+});
+
+test('a marker without a recorded remote cannot be settled by looking at the current configuration', async () => {
+  const ops = new FakeRemote();
+  ops.branchSha = APPROVED;
+  const s = stateWith({ inFlight: 'push' });
+  s.publish.inFlightRemote = undefined;
+  const r = await acknowledgePublish(s, ctx(ops), { completed: false });
+  assert.ok(!r.ok && r.code === 'unconfirmed');
+  assert.equal(ops.queried.length, 0);
+  // Evidence from the user is still accepted: it does not rely on a remote lookup.
+  const ev = await acknowledgePublish(s, ctx(ops), { completed: true, evidence: { remoteSha: APPROVED } });
+  assert.ok(ev.ok, JSON.stringify(ev));
+});
+
+// ------------------------------------------------------------------ explicit mismatch is not a gap
+
+test('a pushed branch at another commit stays paused even when the user reports the approved commit', async () => {
+  const ops = new FakeRemote();
+  ops.branchSha = OTHER;
+  const s = stateWith({ inFlight: 'push' });
+  const r = await acknowledgePublish(s, ctx(ops), { completed: true, evidence: { remoteSha: APPROVED } });
+  assert.ok(!r.ok && r.code === 'contradicts-remote', JSON.stringify(r));
+  assert.match((r as any).message, /cccccccc/);
+  assert.equal(s.publish.inFlight, 'push');
+  assert.equal(s.publish.pushed, undefined);
+});
+
+test('a pull request with another head stays paused even with a PR URL as evidence', async () => {
+  const ops = new FakeRemote();
+  ops.pr = { url: 'https://github.com/o/r/pull/7', state: 'OPEN', headSha: OTHER, mergeCommit: '' };
+  const s = stateWith({ inFlight: 'pr' });
+  const r = await acknowledgePublish(s, ctx(ops), { completed: true, evidence: { prUrl: 'https://github.com/o/r/pull/7' } });
+  assert.ok(!r.ok && r.code === 'contradicts-remote', JSON.stringify(r));
+  assert.equal(s.publish.prUrl, undefined);
+  assert.equal(s.publish.inFlight, 'pr');
+});
+
+test('a merge check on a pull request with another head stays paused even with a merge commit as evidence', async () => {
+  const ops = new FakeRemote();
+  ops.pr = { url: 'https://github.com/o/r/pull/7', state: 'MERGED', headSha: OTHER, mergeCommit: MERGED };
+  const s = stateWith({ inFlight: 'merge', prUrl: 'https://github.com/o/r/pull/7' });
+  const r = await acknowledgePublish(s, ctx(ops), { completed: true, evidence: { mergeSha: MERGED } });
+  assert.ok(!r.ok && r.code === 'contradicts-remote', JSON.stringify(r));
+  assert.equal(s.publish.merged, undefined);
+});
+
+test('a remote tag at another commit stays paused even when the user reports the merge commit', async () => {
+  const ops = new FakeRemote();
+  ops.tagSha = OTHER;
+  const s = stateWith({ inFlight: 'tag', pendingTag: 'v1.0.1', mergeSha: MERGED, merged: true });
+  const r = await acknowledgePublish(s, ctx(ops), { completed: true, evidence: { remoteSha: MERGED } });
+  assert.ok(!r.ok && r.code === 'contradicts-remote', JSON.stringify(r));
+  assert.equal(s.publish.tagPushed, undefined);
+  assert.equal(s.publish.inFlight, 'tag');
+});
+
+test('a lookup that fails is still different from a mismatch: evidence settles it', async () => {
+  const down = new FakeRemote();
+  down.fail.lsBranch = 'timeout';
+  const s = stateWith({ inFlight: 'push' });
+  const r = await acknowledgePublish(s, ctx(down), { completed: true, evidence: { remoteSha: APPROVED } });
+  assert.ok(r.ok, JSON.stringify(r));
 });

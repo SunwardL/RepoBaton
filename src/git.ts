@@ -75,6 +75,11 @@ export async function branchExists(cwd: string, branch: string): Promise<boolean
   return r.trim().length > 0;
 }
 
+/** A remote address without credentials or query strings, safe to store in run state and compare later. */
+export function sanitizeRemoteUrl(url: string): string {
+  return url.trim().replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]*@/i, '$1').replace(/[?#].*$/, '');
+}
+
 export async function remoteUrl(cwd: string, remote: string): Promise<string | null> {
   const out = await git(cwd, ['remote', 'get-url', remote], { allowFail: true });
   return out.trim() || null;
@@ -313,11 +318,13 @@ export interface RemoteOps {
   ghMarkReady(cwd: string, pr: string): Promise<void>;
   ghMergePr(cwd: string, pr: string, headSha: string): Promise<void>;
   ghMergeCommit(cwd: string, pr: string): Promise<string>;
+  /** Read-only: the address configured for a remote (credentials included; sanitize before storing), or null. */
+  remoteUrl(cwd: string, remote: string): Promise<string | null>;
   remoteBranchSha(cwd: string, remote: string, branch: string): Promise<string>;
   remoteTagTarget(cwd: string, remote: string, tag: string): Promise<string>;
   ghPrView(cwd: string, ref: string): Promise<PrInfo | null>;
 }
 
 export const realRemoteOps: RemoteOps = {
-  push, pushTag, fetchRemote, ghAvailable, ghCreatePr, ghMarkReady, ghMergePr, ghMergeCommit, remoteBranchSha, remoteTagTarget, ghPrView,
+  push, pushTag, fetchRemote, ghAvailable, ghCreatePr, ghMarkReady, ghMergePr, ghMergeCommit, remoteUrl, remoteBranchSha, remoteTagTarget, ghPrView,
 };
