@@ -24,6 +24,7 @@ import {
   type StageName,
 } from './types.ts';
 import { formatFeedback, judge } from './verdict.ts';
+import { redactDeep, redactDiagnostic } from './redact.ts';
 import { ensureDir, nowIso, sleep, slugify, tail, truncate, validateSchema, readJson, exists } from './util.ts';
 
 export class PipelineError extends Error {
@@ -32,7 +33,7 @@ export class PipelineError extends Error {
   kind?: AgentErrorKind;
   agent?: string;
   constructor(message: string, status: RunState['status'] = 'failed') {
-    super(message);
+    super(redactDiagnostic(message));
     this.name = 'PipelineError';
     this.status = status;
   }
@@ -48,6 +49,8 @@ export interface PipelineOptions {
   approvePlan?: (plan: Plan) => Promise<{ approved: true } | { approved: false; feedback: string }>;
   /** Override the configured publish actions for this run. */
   publishOverride?: Partial<Config['publish']>;
+  /** Remote operations (push, gh, tags). Tests pass fakes so nothing reaches a real remote. */
+  remote?: G.RemoteOps;
   /** Stamped onto every run this pipeline executes. Set by the local server, never by the CLI. */
   owner?: NonNullable<RunState['owner']>;
 }
@@ -70,9 +73,11 @@ export class Pipeline {
   private registry: AgentRegistry;
   private signal?: AbortSignal;
   private opts: PipelineOptions;
+  private ops: G.RemoteOps;
 
   constructor(opts: PipelineOptions) {
     this.opts = opts;
+    this.ops = opts.remote ?? G.realRemoteOps;
     this.repo = opts.repo;
     this.cfg = opts.publishOverride
       ? { ...opts.config, publish: { ...opts.config.publish, ...opts.publishOverride } }
@@ -210,7 +215,7 @@ export class Pipeline {
     });
     await this.events.flush();
     await this.store.save(state);
-    await fs.writeFile(path.join(this.store.dir(state.id), 'report.md'), renderReport(state), 'utf8');
+    await fs.writeFile(path.join(this.store.dir(state.id), 'report.md'), renderReport(redactDeep(state, { assignments: true })), 'utf8');
     return state;
   }
 
@@ -225,6 +230,8 @@ export class Pipeline {
 
   private async prepare(state: RunState): Promise<void> {
     if (state.worktree && (await exists(state.worktree))) {
+      // A saved worktree whose setup never finished: complete it now (no-op when setup is done).
+      await this.runSetup(state);
       return;
     }
     await this.checkpoint(state, 'prepare');
@@ -233,16 +240,23 @@ export class Pipeline {
       this.log.warn('your working tree has uncommitted changes; the run starts from the committed base branch and will not include them');
     }
     const baseBranch = this.cfg.git.baseBranch || (await G.guessBaseBranch(root));
-    const baseSha = await G.revParse(root, baseBranch).catch(() => {
-      throw new PipelineError(`base branch "${baseBranch}" not found; set git.baseBranch`);
-    });
-    state.base = { branch: baseBranch, sha: baseSha };
+    // A resumed run keeps the base it was reviewed against, even if the base branch has moved on.
+    if (!state.base) {
+      const baseSha = await G.revParse(root, baseBranch).catch(() => {
+        throw new PipelineError(`base branch "${baseBranch}" not found; set git.baseBranch`);
+      });
+      state.base = { branch: baseBranch, sha: baseSha };
+    }
+    const baseSha = state.base.sha;
     state.branch ??= `${this.cfg.git.branchPrefix}${slugify(state.task)}-${state.id.slice(-4)}`;
     const dir = path.resolve(root, this.cfg.git.worktreeDir, state.id);
     await G.excludeLocally(root, '/.repobaton/');
-    await G.addWorktree(root, dir, state.branch, baseSha);
+    // The folder may already be a worktree of this branch (a crash between creating it and saving state).
+    if (!(await G.isWorktreeOf(dir, state.branch))) await G.addWorktree(root, dir, state.branch, baseSha);
     state.worktree = dir;
-    this.log.stage('prepare', `branch ${state.branch} from ${baseBranch}@${baseSha.slice(0, 8)}`);
+    // A recreated worktree has no installed dependencies: run setup again.
+    state.setupDone = false;
+    this.log.stage('prepare', `branch ${state.branch} from ${state.base.branch}@${baseSha.slice(0, 8)}`);
     await this.store.save(state);
     await this.runSetup(state);
   }
@@ -361,6 +375,7 @@ export class Pipeline {
       });
       await this.restoreClean(state, state.base!.sha);
       state.plan = res.structured as Plan;
+      state.planVersion = (state.planVersion ?? 0) + 1;
       state.planAgent = res.agentId;
       await this.store.artifact(state.id, 'plan.md', formatPlan(state.plan) + '\n\n## Acceptance\n' + formatAcceptance(state.plan));
       await this.store.save(state);
@@ -411,6 +426,9 @@ export class Pipeline {
   }
 
   private async implementLoop(state: RunState): Promise<boolean> {
+    // An approved commit is already saved: go straight to release/publish with that exact SHA.
+    // No new implement round, and an exhausted round budget cannot block it.
+    if (state.rounds.some((r) => r.decision === 'approved' && r.implement)) return true;
     for (;;) {
       let round = state.rounds[state.rounds.length - 1];
       if (!round || round.decision) {
@@ -676,7 +694,10 @@ export class Pipeline {
       throw new PipelineError(
         `the previous attempt was interrupted while doing "${op}", and it is unknown whether it completed. ` +
           `Check the remote (branch ${state.branch ?? ''}${state.publish.prUrl ? `, ${state.publish.prUrl}` : ''}), ` +
-          `then clear the marker with "Mark as checked" and resume.`,
+          // A run started from the UI server has an owner; a standalone CLI run does not. Point at the action that exists there.
+          (this.opts.owner
+            ? 'then use "Check the remote" on the run page, and continue.'
+            : `then run "repobaton check ${state.id}" in this repository, and resume.`),
         'needs-human',
       );
     }
@@ -699,16 +720,16 @@ export class Pipeline {
     if (p.push && !state.publish.pushed) {
       if (!(await G.remoteUrl(this.repo, p.remote))) throw new PipelineError(`remote "${p.remote}" is not configured`, 'needs-human');
       await this.markInFlight(state, 'push');
-      await G.push(wt, p.remote, branch);
+      await this.ops.push(wt, p.remote, branch);
       state.publish.inFlight = undefined;
       state.publish.pushed = true;
       this.log.stage('publish', `pushed ${branch} to ${p.remote}`);
       await this.store.save(state);
     }
     if (p.createPr && !state.publish.prUrl) {
-      if (!(await G.ghAvailable(wt))) throw new PipelineError('publish.createPr needs the GitHub CLI ("gh") installed and logged in', 'needs-human');
+      if (!(await this.ops.ghAvailable(wt))) throw new PipelineError('publish.createPr needs the GitHub CLI ("gh") installed and logged in', 'needs-human');
       await this.markInFlight(state, 'pr');
-      state.publish.prUrl = await G.ghCreatePr(wt, {
+      state.publish.prUrl = await this.ops.ghCreatePr(wt, {
         base: state.base!.branch,
         head: branch,
         title: rel.pr_title,
@@ -722,15 +743,15 @@ export class Pipeline {
     if (p.merge && !state.publish.merged) {
       const pr = state.publish.prUrl!;
       await this.markInFlight(state, 'merge');
-      await G.ghMarkReady(wt, pr);
-      await G.ghMergePr(wt, pr, approvedSha);
+      await this.ops.ghMarkReady(wt, pr);
+      await this.ops.ghMergePr(wt, pr, approvedSha);
       state.publish.inFlight = undefined;
       state.publish.merged = true;
-      state.publish.mergeSha = (await G.ghMergeCommit(wt, pr)) || undefined;
+      state.publish.mergeSha = (await this.ops.ghMergeCommit(wt, pr)) || undefined;
       this.log.stage('publish', `merged ${pr}`);
       await this.store.save(state);
     }
-    if (p.tag && !state.publish.tag) {
+    if (p.tag && !state.publish.tagPushed) {
       await this.tagRelease(state, rel);
     }
   }
@@ -743,15 +764,17 @@ export class Pipeline {
     }
     const tag = `${p.tagPrefix}${rel.suggested_version}`;
     const root = this.repo;
-    if (await G.tagExists(root, tag)) throw new PipelineError(`tag ${tag} already exists`, 'needs-human');
+    if ((await G.tagExists(root, tag)) && state.publish.pendingTag !== tag) throw new PipelineError(`tag ${tag} already exists`, 'needs-human');
     // Tag the commit that actually landed on the base branch.
-    await G.fetchRemote(root, p.remote);
+    await this.ops.fetchRemote(root, p.remote);
     const sha = state.publish.mergeSha;
     if (!sha) throw new PipelineError('cannot tag: merge commit is unknown', 'needs-human');
+    state.publish.pendingTag = tag;
     await this.markInFlight(state, 'tag');
-    await G.createTag(root, tag, sha, rel.release_notes || tag);
+    // A tag that already exists locally at the merge commit (an earlier attempt got that far) is reused.
+    if ((await G.tagTarget(root, tag)) !== sha) await G.createTag(root, tag, sha, rel.release_notes || tag);
     state.publish.tag = tag;
-    await G.pushTag(root, p.remote, tag);
+    await this.ops.pushTag(root, p.remote, tag);
     state.publish.inFlight = undefined;
     state.publish.tagPushed = true;
     this.log.stage('publish', `tagged ${tag} @ ${sha.slice(0, 8)}`);

@@ -11,6 +11,7 @@ import * as G from './git.ts';
 import { createLogger } from './log.ts';
 import { eventsFile, followEvents, formatEventLine, SETTLED_STATUSES } from './events.ts';
 import { Pipeline } from './pipeline.ts';
+import { AckRefused, checkAndRecord } from './publishcheck.ts';
 import { formatPlan, renderReport } from './report.ts';
 import { RunStore } from './store.ts';
 import { configTemplate } from './template.ts';
@@ -31,6 +32,8 @@ Usage:
   repobaton status [run|last] [--follow]   list runs, or show one; --follow streams its live events
   repobaton report <run|last>              print the Markdown report
   repobaton cleanup <run|last> [--delete-branch]
+  repobaton check <run|last> [--completed|--not-completed] [--evidence <sha|pr-url>]
+                                           ask the remote about an interrupted push/PR/merge/tag step and record what it confirms
   repobaton config                         print the effective configuration
 
 Run options:
@@ -91,6 +94,9 @@ const OPTIONS = {
   follow: { type: 'boolean', short: 'f' },
   port: { type: 'string' },
   'no-open': { type: 'boolean' },
+  completed: { type: 'boolean' },
+  'not-completed': { type: 'boolean' },
+  evidence: { type: 'string' },
   project: { type: 'string', multiple: true },
   verbose: { type: 'boolean', short: 'v' },
   quiet: { type: 'boolean', short: 'q' },
@@ -372,6 +378,30 @@ async function cmdCleanup(f: Flags, positional: string[]): Promise<void> {
   process.stdout.write('worktree removed\n');
 }
 
+async function cmdCheck(f: Flags, positional: string[]): Promise<number> {
+  const repo = await repoOf(f);
+  const loaded = await loadConfig(repo, typeof f.config === 'string' ? f.config : undefined).catch(handleConfigError);
+  const store = new RunStore(repo);
+  const id = await store.resolve(positional[0] ?? fail('missing run id (or "last")'));
+  const state = await store.load(id);
+  const op = state.publish.inFlight;
+  const raw = typeof f.evidence === 'string' ? f.evidence.trim() : '';
+  const evidence = !raw ? undefined : op === 'pr' ? { prUrl: raw } : op === 'merge' ? { mergeSha: raw } : { remoteSha: raw };
+  const completed = f.completed ? true : f['not-completed'] ? false : undefined;
+  try {
+    const r = await checkAndRecord(store, repo, loaded.config, id, { completed, evidence });
+    if (!r.ok) {
+      process.stderr.write(r.message + '\n');
+      return 3;
+    }
+    process.stdout.write(`recorded: ${r.recorded} - ${r.summary}\nnext: repobaton resume ${id}\n`);
+    return 0;
+  } catch (e) {
+    if (e instanceof AckRefused) return fail(e.message);
+    throw e;
+  }
+}
+
 async function cmdUi(f: Flags): Promise<number> {
   const port = typeof f.port === 'string' ? Number(f.port) : undefined;
   if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) fail('--port must be 0-65535');
@@ -446,6 +476,8 @@ async function main(): Promise<number> {
     case 'cleanup':
       await cmdCleanup(f, pos);
       return 0;
+    case 'check':
+      return cmdCheck(f, pos);
     case 'config': {
       const repo = await repoOf(f);
       const loaded = await loadConfig(repo, typeof f.config === 'string' ? f.config : undefined).catch(handleConfigError);

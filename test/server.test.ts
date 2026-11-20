@@ -213,6 +213,7 @@ async function waitFor<T>(fn: () => Promise<T | undefined | false>, ms = 20000):
 
 const runsPath = (pid: string, id?: string, tail = ''): string => `/api/projects/${pid}/runs${id ? `/${id}` : ''}${tail}`;
 const statusOf = async (h: Harness, pid: string, id: string): Promise<string> => (await h.call('GET', runsPath(pid, id))).json.run.status;
+const planVer = async (h: Harness, pid: string, id: string): Promise<number> => (await h.call('GET', runsPath(pid, id))).json.run.planVersion;
 const idle = async (h: Harness, pid: string): Promise<boolean> => !(await h.call('GET', '/api/projects')).json.projects.find((p: any) => p.id === pid).busy;
 
 // ---------------------------------------------------------------- tests
@@ -263,7 +264,7 @@ test('flow: new task -> waits for approval -> approve -> result', async () => {
     await waitFor(() => idle(h, pid));
     assert.equal((await h.call('GET', runsPath(pid, id))).json.run.plan.summary, 'plan');
 
-    assert.equal((await h.call('POST', runsPath(pid, id, '/approve'), {})).status, 202);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: await planVer(h, pid, id) })).status, 202);
     await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded');
 
     assert.match((await h.call('GET', runsPath(pid, id, '/diff'))).json.diff, /\+good/);
@@ -283,14 +284,14 @@ test('flow: reject with feedback re-plans, pauses again, then approve completes'
     const id = (await h.call('POST', runsPath(pid), { task: 'make value good' })).json.id as string;
     await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
     await waitFor(() => idle(h, pid));
-    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), {})).status, 400, 'feedback required');
-    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'add a rollback step' })).status, 202);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), { expectPlanVersion: await planVer(h, pid, id) })).status, 400, 'feedback required');
+    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'add a rollback step', expectPlanVersion: await planVer(h, pid, id) })).status, 202);
     await waitFor(async () => (await h.call('GET', runsPath(pid, id))).json.run.usage.calls >= 2 && (await idle(h, pid)));
     const mid = (await h.call('GET', runsPath(pid, id))).json.run;
     assert.equal(mid.status, 'awaiting-plan-approval');
     assert.equal(mid.rounds.length, 0, 'implementation has not started');
     assert.ok(h.agent.calls.some((c) => c.prompt.includes('add a rollback step')), 'planner saw the feedback');
-    await h.call('POST', runsPath(pid, id, '/approve'), {});
+    await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: await planVer(h, pid, id) });
     await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded');
   } finally {
     await h.close();
@@ -368,8 +369,8 @@ test('while a repository executes: starts are refused "busy", reads still work',
     const b = (await h.call('POST', runsPath(pid), { task: 'B' })).json.id as string;
     await gate.entered;
     assert.equal((await h.call('POST', runsPath(pid), { task: 'C' })).json.error.code, 'busy');
-    assert.equal((await h.call('POST', runsPath(pid, a, '/approve'), {})).status, 409, 'approve needs the slot too');
-    assert.equal((await h.call('POST', runsPath(pid, a, '/reject'), { feedback: 'x' })).json.error.code, 'busy');
+    assert.equal((await h.call('POST', runsPath(pid, a, '/approve'), { expectPlanVersion: 1 })).status, 409, 'approve needs the slot too');
+    assert.equal((await h.call('POST', runsPath(pid, a, '/reject'), { feedback: 'x', expectPlanVersion: 1 })).json.error.code, 'busy');
     assert.equal((await h.call('GET', runsPath(pid))).json.runs.length, 2);
     assert.equal((await h.call('GET', runsPath(pid, a))).status, 200);
     assert.equal((await h.call('GET', runsPath(pid, b, '/events'))).status, 200);
@@ -391,7 +392,8 @@ test('duplicate and stale approvals start exactly one execution', async () => {
     await waitFor(() => idle(h, pid));
 
     // Eight clicks on "approve" at once: one wins, the rest are refused.
-    const results = await Promise.all(Array.from({ length: 8 }, () => h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval' })));
+    const ver = await planVer(h, pid, id);
+    const results = await Promise.all(Array.from({ length: 8 }, () => h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval', expectPlanVersion: ver })));
     assert.equal(results.filter((r) => r.status === 202).length, 1);
     assert.equal(results.filter((r) => r.status === 409).length, 7);
     await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded');
@@ -399,12 +401,12 @@ test('duplicate and stale approvals start exactly one execution', async () => {
 
     // A late, stale approval after the run finished is refused and starts nothing.
     const before = h.agent.calls.length;
-    const stale = await h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval' });
+    const stale = await h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval', expectPlanVersion: ver });
     assert.equal(stale.status, 409);
     assert.equal(stale.json.error.code, 'wrong-state');
     assert.equal(h.agent.calls.length, before);
     // A stale reject is refused the same way.
-    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'late' })).json.error.code, 'wrong-state');
+    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'late', expectPlanVersion: ver })).json.error.code, 'wrong-state');
     assert.equal(h.agent.calls.length, before);
   } finally {
     await h.close();
@@ -418,7 +420,7 @@ test('a request carrying an outdated expected status is refused even when the ru
     const id = (await h.call('POST', runsPath(pid), { task: 'x' })).json.id as string;
     await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
     await waitFor(() => idle(h, pid));
-    const stale = await h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'interrupted' });
+    const stale = await h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'interrupted', expectPlanVersion: await planVer(h, pid, id) });
     assert.equal(stale.status, 409);
     assert.match(stale.json.error.message, /now awaiting-plan-approval/);
     assert.equal(h.agent.calls.filter((c) => c.prompt.includes('IMPLEMENTER')).length, 0);
@@ -523,6 +525,110 @@ test('API: input validation and unknown things', async () => {
     await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
     await waitFor(() => idle(h, pid));
     assert.equal((await h.call('POST', runsPath(pid, id, '/resume'), {})).json.error.code, 'wrong-state');
+  } finally {
+    await h.close();
+  }
+});
+
+// ---------------------------------------------------------------- plan versions
+
+test('two windows: after plan A is rejected and plan B is pending, the old window cannot approve or reject A', async () => {
+  const h = await harness([await makeRepo()]);
+  const [pid] = h.projectIds;
+  try {
+    const id = (await h.call('POST', runsPath(pid), { task: 'make value good' })).json.id as string;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
+    await waitFor(() => idle(h, pid));
+    const versionA = await planVer(h, pid, id);
+
+    // Window 1 and window 2 both show plan A. Window 2 rejects it; plan B appears.
+    const rejected = await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'add a rollback step', expectPlanVersion: versionA });
+    assert.equal(rejected.status, 202);
+    await waitFor(async () => (await planVer(h, pid, id)) > versionA && (await statusOf(h, pid, id)) === 'awaiting-plan-approval' && (await idle(h, pid)));
+    const versionB = await planVer(h, pid, id);
+    assert.ok(versionB > versionA);
+
+    // Window 1 is still looking at A. Neither action may take effect.
+    const before = h.agent.calls.length;
+    const oldApprove = await h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval', expectPlanVersion: versionA });
+    assert.equal(oldApprove.status, 409);
+    assert.equal(oldApprove.json.error.code, 'stale-plan');
+    assert.match(oldApprove.json.error.message, /refresh/i);
+    assert.equal(oldApprove.json.error.planVersion, versionB);
+    const oldReject = await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'from the old page', expectStatus: 'awaiting-plan-approval', expectPlanVersion: versionA });
+    assert.equal(oldReject.json.error.code, 'stale-plan');
+    assert.equal(h.agent.calls.length, before, 'a stale decision starts nothing');
+    assert.equal((await h.call('GET', runsPath(pid, id))).json.run.planApproved, false);
+    assert.equal(h.agent.calls.filter((c) => c.prompt.includes('IMPLEMENTER')).length, 0);
+
+    // The refreshed window approves B; a double click on B runs exactly once.
+    const both = await Promise.all([1, 2, 3].map(() => h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval', expectPlanVersion: versionB })));
+    assert.equal(both.filter((r) => r.status === 202).length, 1);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded');
+    assert.equal(h.agent.calls.filter((c) => c.prompt.includes('IMPLEMENTER')).length, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test('approve and reject without a plan version are refused', async () => {
+  const h = await harness([await makeRepo()]);
+  const [pid] = h.projectIds;
+  try {
+    const id = (await h.call('POST', runsPath(pid), { task: 'x' })).json.id as string;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
+    await waitFor(() => idle(h, pid));
+    const a = await h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval' });
+    assert.equal(a.status, 400);
+    assert.match(a.json.error.message, /expectPlanVersion/);
+    const r = await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'x' });
+    assert.equal(r.status, 400);
+    assert.equal(h.agent.calls.filter((c) => c.prompt.includes('IMPLEMENTER')).length, 0);
+    assert.equal(await statusOf(h, pid, id), 'awaiting-plan-approval');
+  } finally {
+    await h.close();
+  }
+});
+
+test('the plan version is checked after the slot is held: a request racing a running replan is refused as busy, not applied', async () => {
+  const h = await harness([await makeRepo()]);
+  const [pid] = h.projectIds;
+  try {
+    const id = (await h.call('POST', runsPath(pid), { task: 'x' })).json.id as string;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
+    await waitFor(() => idle(h, pid));
+    const v1 = await planVer(h, pid, id);
+    const gate = h.gatePlanner();
+    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'again', expectPlanVersion: v1 })).status, 202);
+    await gate.entered; // the replan is running and holds the slot
+    const during = await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: v1 });
+    assert.equal(during.json.error.code, 'busy');
+    gate.release();
+    await waitFor(async () => (await planVer(h, pid, id)) === v1 + 1 && (await idle(h, pid)));
+    assert.equal((await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: v1 })).json.error.code, 'stale-plan');
+  } finally {
+    await h.close();
+  }
+});
+
+test('cleanup shares the repository slot: refused while a replan runs, worktree kept, allowed afterwards', async () => {
+  const h = await harness([await makeRepo()]);
+  const [pid] = h.projectIds;
+  try {
+    const id = (await h.call('POST', runsPath(pid), { task: 'x' })).json.id as string;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
+    await waitFor(() => idle(h, pid));
+    const v1 = await planVer(h, pid, id);
+    const gate = h.gatePlanner();
+    assert.equal((await h.call('POST', runsPath(pid, id, '/reject'), { feedback: 'again', expectPlanVersion: v1 })).status, 202);
+    await gate.entered;
+    const during = await h.call('POST', runsPath(pid, id, '/cleanup'), {});
+    assert.equal(during.status, 409);
+    assert.equal(during.json.error.code, 'busy');
+    assert.equal((await h.call('GET', runsPath(pid))).json.runs.find((r: any) => r.id === id).hasWorktree, true, 'worktree untouched');
+    gate.release();
+    await waitFor(() => idle(h, pid));
+    assert.equal((await h.call('POST', runsPath(pid, id, '/cleanup'), {})).status, 200);
   } finally {
     await h.close();
   }

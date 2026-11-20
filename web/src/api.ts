@@ -65,6 +65,7 @@ export interface Plan {
 export interface RunDetail extends Omit<RunRow, 'rounds' | 'executing' | 'hasWorktree' | 'publishInFlight'> {
   rounds: Round[];
   plan?: Plan;
+  planVersion?: number;
   planApproved?: boolean;
   worktree?: string;
   base?: { branch: string; sha: string };
@@ -150,13 +151,15 @@ export const api = {
     call<{ events: RunEvent[]; settled: boolean; status: RunStatus }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/events?after=${after}`),
   diff: (id: string, run: string) => call<{ diff: string; stat: string; truncated?: boolean; sha?: string }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/diff`),
   report: (id: string, run: string) => call<{ report: string | null }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/report`),
-  approve: (id: string, run: string) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/approve`, { expectStatus: 'awaiting-plan-approval' }),
-  reject: (id: string, run: string, feedback: string) =>
-    call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/reject`, { feedback, expectStatus: 'awaiting-plan-approval' }),
+  approve: (id: string, run: string, planVersion: number) =>
+    call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/approve`, { expectStatus: 'awaiting-plan-approval', expectPlanVersion: planVersion }),
+  reject: (id: string, run: string, feedback: string, planVersion: number) =>
+    call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/reject`, { feedback, expectStatus: 'awaiting-plan-approval', expectPlanVersion: planVersion }),
   resume: (id: string, run: string, expectStatus: RunStatus, extra: { moreRounds?: number; feedback?: string } = {}) =>
     call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/resume`, { expectStatus, ...extra }),
   cancel: (id: string, run: string) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/cancel`, {}),
   cleanup: (id: string, run: string) => call<{ removedWorktree: boolean; keptBranch?: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/cleanup`, {}),
-  acknowledge: (id: string, run: string, completed: boolean) =>
-    call<{ ok: boolean }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/acknowledge`, { completed }),
+  /** Ask the remote about an interrupted push/PR/merge/tag step. Evidence is only needed when the remote cannot settle it. */
+  check: (id: string, run: string, body: { completed?: boolean; evidence?: { remoteSha?: string; prUrl?: string; mergeSha?: string } } = {}) =>
+    call<{ ok: boolean; recorded: 'done' | 'not-done'; summary: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/check`, body),
 };

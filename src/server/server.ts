@@ -7,7 +7,9 @@ import { loadConfig, ConfigError } from '../config.ts';
 import { eventsFile, readEvents, SETTLED_STATUSES } from '../events.ts';
 import * as G from '../git.ts';
 import { createLogger, type Logger } from '../log.ts';
+import { redactDeep } from '../redact.ts';
 import { Pipeline, PipelineError } from '../pipeline.ts';
+import { AckRefused, checkAndRecord } from '../publishcheck.ts';
 import { ProjectRegistry, userDataDir, type ProjectEntry } from '../projects.ts';
 import { cleanupRun, CleanupRefused, recoverInterrupted, type Prober } from '../recovery.ts';
 import { identifyRepo, NotAGitRepoError, type RepoIdentity } from '../repoid.ts';
@@ -31,6 +33,8 @@ export interface ServerOptions {
   /** Test hooks. */
   makePipeline?: (ctx: PipelineContext) => Pipeline;
   probe?: Prober;
+  /** Remote operations; tests pass fakes so no real remote or GitHub is contacted. */
+  remote?: G.RemoteOps;
   /** Stable id of this server instance; random per start unless a test pins it. */
   serverId?: string;
   /** Test hook: skip the startup recovery scan. */
@@ -87,7 +91,7 @@ async function readBody(req: http.IncomingMessage): Promise<Record<string, unkno
 
 function send(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(JSON.stringify(body));
+  res.end(JSON.stringify(redactDeep(body, { assignments: true })));
 }
 
 const MIME: Record<string, string> = {
@@ -168,7 +172,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     opts.makePipeline ??
     ((ctx: PipelineContext): Pipeline =>
       // No interactive approver: a run that needs approval stops at the plan and waits for the UI.
-      new Pipeline({ repo: ctx.repoRoot, config: ctx.config, log: ctx.log, signal: ctx.signal, owner: ctx.owner }));
+      new Pipeline({ repo: ctx.repoRoot, config: ctx.config, log: ctx.log, signal: ctx.signal, owner: ctx.owner, remote: opts.remote }));
 
   /**
    * Start execution for a project. The slot is taken before anything is awaited, so the
@@ -337,7 +341,11 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
         if (method === 'POST' && e === 'cleanup') {
           try {
-            const r = await cleanupRun(l.store, l.identity.root, id, (rid) => slots.isExecuting(rid), G.removeWorktree);
+            // Cleanup takes the repository's slot like every other mutation: while it holds it, no
+            // resume/approve can start using this worktree, and while one of those runs, cleanup is busy.
+            const r = await slots.run(l.identity.key, 'cleanup', () =>
+              cleanupRun(l.store, l.identity.root, id, (rid) => slots.isExecuting(rid), G.removeWorktree),
+            );
             return send(res, 200, r);
           } catch (err) {
             if (err instanceof CleanupRefused) throw new HttpError(409, 'cleanup-refused', err.message);
@@ -345,23 +353,32 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           }
         }
 
-        if (method === 'POST' && e === 'acknowledge') {
-          // The user has checked the remote after an interrupted publish step.
-          const state = await l.store.load(id);
-          if (!state.publish.inFlight) throw new HttpError(409, 'wrong-state', 'nothing to acknowledge');
-          if (slots.isExecuting(id)) throw new HttpError(409, 'busy', 'this run is executing');
+        if (method === 'POST' && (e === 'acknowledge' || e === 'check')) {
+          // Ask the remote what happened to an interrupted publish step and record only what it confirms
+          // (or what the user's evidence settles). Holds the repository slot like any other mutation.
           const body = await readBody(req);
-          const outcome = body.completed === true;
-          const op = state.publish.inFlight;
-          // The user tells us what they saw, so the record matches reality.
-          if (outcome) {
-            if (op === 'push') state.publish.pushed = true;
-            if (op === 'tag') state.publish.tagPushed = true;
+          const ev = body.evidence && typeof body.evidence === 'object' ? (body.evidence as Record<string, unknown>) : {};
+          const evidence = {
+            remoteSha: typeof ev.remoteSha === 'string' ? ev.remoteSha : undefined,
+            prUrl: typeof ev.prUrl === 'string' ? ev.prUrl : undefined,
+            mergeSha: typeof ev.mergeSha === 'string' ? ev.mergeSha : undefined,
+          };
+          const hasEvidence = Object.values(evidence).some(Boolean);
+          const completed = typeof body.completed === 'boolean' ? body.completed : undefined;
+          try {
+            const r = await slots.run(l.identity.key, 'check', async (holder) => {
+              holder.runId = id;
+              return checkAndRecord(l.store, l.identity.root, l.config, id, { completed, evidence: hasEvidence ? evidence : undefined }, opts.remote);
+            });
+            if (!r.ok) {
+              const status = r.code === 'nothing-to-ack' ? 409 : 422;
+              throw new HttpError(status, r.code, r.message);
+            }
+            return send(res, 200, { ok: true, recorded: r.recorded, summary: r.summary });
+          } catch (err) {
+            if (err instanceof AckRefused) throw new HttpError(409, err.code, err.message);
+            throw err;
           }
-          state.publish.inFlight = undefined;
-          if (state.status === 'needs-human' || state.status === 'interrupted') state.error = 'publish step checked by a human; ready to resume';
-          await l.store.save(state);
-          return send(res, 200, { ok: true });
         }
 
         if (method === 'POST' && (e === 'approve' || e === 'reject' || e === 'resume')) {
@@ -392,6 +409,14 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
               if (state.status === 'running') wrong('this run is already running');
               if (state.status === 'succeeded') wrong('this run already succeeded');
               if (state.publish.inFlight) wrong('an external step was interrupted; check it and mark it as checked first');
+            }
+            if (e === 'approve' || e === 'reject') {
+              // The user must name the plan version they were looking at; checked while holding the slot.
+              if (typeof body.expectPlanVersion !== 'number') throw new HttpError(400, 'bad-request', 'expectPlanVersion is required to approve or reject a plan');
+              const current = state.planVersion ?? 0;
+              if (current !== body.expectPlanVersion) {
+                throw new HttpError(409, 'stale-plan', 'the plan changed since you opened it (now version ' + current + '); refresh the page and review it again', { planVersion: current, status: state.status });
+              }
             }
             setId(id);
             if (e === 'approve') return p.resume(id, { approvePlan: true });
@@ -428,7 +453,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       if (err instanceof HttpError) return send(res, err.status, { error: { code: err.code, message: err.message, ...(err.extra ?? {}) } });
       if (err instanceof BusyError) return send(res, 409, { error: { code: 'busy', message: err.message, runId: err.runId ?? null } });
       if (err instanceof PipelineError) return send(res, 409, { error: { code: 'pipeline', message: err.message } });
-      log.error(`unhandled: ${(err as Error).stack ?? err}`);
+      log.error(`unhandled: ${(err as Error).stack ?? err}`); // the logger masks it
       send(res, 500, { error: { code: 'internal', message: 'internal error' } });
     });
   });

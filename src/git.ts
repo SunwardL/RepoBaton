@@ -1,12 +1,13 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { runProcess } from './proc.ts';
+import { redactDiagnostic } from './redact.ts';
 import { ensureDir, exists } from './util.ts';
 
 export class GitError extends Error {
   code: number | null;
   constructor(message: string, code: number | null) {
-    super(message);
+    super(redactDiagnostic(message));
     this.name = 'GitError';
     this.code = code;
   }
@@ -30,6 +31,8 @@ export async function git(cwd: string, args: string[], opts: GitOptions = {}): P
     env: { GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true', LC_ALL: 'C', ...(opts.env ?? {}) },
   });
   if (r.error) throw new GitError(`cannot run git: ${r.error}`, null);
+  // A killed process may or may not have finished its work: code null marks the outcome as unknown.
+  if ((r.timedOut || r.aborted) && !opts.allowFail) throw new GitError(`git ${args[0]} ${r.timedOut ? 'timed out' : 'was cancelled'}; its outcome is unknown`, null);
   if (r.code !== 0 && !opts.allowFail) {
     throw new GitError(`git ${args.join(' ')} failed (${r.code}): ${(r.stderr || r.stdout).trim()}`, r.code);
   }
@@ -103,6 +106,13 @@ export async function removeWorktree(root: string, dir: string): Promise<void> {
   await git(root, ['worktree', 'prune'], { allowFail: true });
 }
 
+/** Is `dir` already a working tree with `branch` checked out? (Used to adopt a half-created worktree.) */
+export async function isWorktreeOf(dir: string, branch: string): Promise<boolean> {
+  if (!(await exists(path.join(dir, '.git')))) return false;
+  const cur = (await git(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { allowFail: true })).trim();
+  return cur === branch;
+}
+
 export interface CommitInfo {
   sha: string;
   created: boolean;
@@ -164,6 +174,12 @@ export async function push(cwd: string, remote: string, branch: string): Promise
   await git(cwd, ['push', '--set-upstream', remote, `${branch}:${branch}`], { timeoutMs: 300_000 });
 }
 
+/** The commit a local tag points at, or '' when there is no such tag. */
+export async function tagTarget(cwd: string, tag: string): Promise<string> {
+  const out = await git(cwd, ['rev-parse', '--verify', '--quiet', `refs/tags/${tag}^{commit}`], { allowFail: true });
+  return out.trim();
+}
+
 export async function createTag(cwd: string, tag: string, sha: string, message: string): Promise<void> {
   await git(cwd, ['tag', '-a', tag, sha, '-m', message]);
 }
@@ -194,6 +210,7 @@ export async function ghCreatePr(
   const args = ['pr', 'create', '--base', o.base, '--head', o.head, '--title', o.title, '--body-file', '-'];
   if (o.draft) args.push('--draft');
   const r = await runProcess({ command: 'gh', args, cwd, input: o.body, timeoutMs: 120_000 });
+  if (r.timedOut || r.aborted) throw new GitError(`gh pr create ${r.timedOut ? 'timed out' : 'was cancelled'}; its outcome is unknown`, null);
   if (r.code !== 0) {
     // An existing PR for the branch is fine: look it up instead of failing the run.
     const existing = await runProcess({
@@ -217,6 +234,7 @@ export async function ghMergePr(cwd: string, pr: string, headSha: string): Promi
     cwd,
     timeoutMs: 180_000,
   });
+  if (r.timedOut || r.aborted) throw new GitError(`gh pr merge ${r.timedOut ? 'timed out' : 'was cancelled'}; its outcome is unknown`, null);
   if (r.code !== 0) throw new GitError(`gh pr merge failed: ${(r.stderr || r.stdout).trim()}`, r.code);
 }
 
@@ -237,3 +255,69 @@ export async function ghMergeCommit(cwd: string, pr: string): Promise<string> {
 export async function fetchRemote(cwd: string, remote: string): Promise<void> {
   await git(cwd, ['fetch', remote, '--tags'], { timeoutMs: 300_000 });
 }
+
+export interface PrInfo {
+  url: string;
+  state: 'OPEN' | 'MERGED' | 'CLOSED';
+  /** Head commit of the PR branch. */
+  headSha: string;
+  /** Merge commit on the base branch, when merged. */
+  mergeCommit: string;
+}
+
+/** Read-only: the commit a branch points at on the remote, or '' when the remote has no such branch. */
+export async function remoteBranchSha(cwd: string, remote: string, branch: string): Promise<string> {
+  const out = await git(cwd, ['ls-remote', '--heads', remote, `refs/heads/${branch}`], { timeoutMs: 60_000 });
+  return out.trim().split(/\s+/)[0] ?? '';
+}
+
+/** Read-only: the commit a tag resolves to on the remote (annotated tags are peeled), or ''. */
+export async function remoteTagTarget(cwd: string, remote: string, tag: string): Promise<string> {
+  const out = await git(cwd, ['ls-remote', '--tags', remote, `refs/tags/${tag}`, `refs/tags/${tag}^{}`], { timeoutMs: 60_000 });
+  const rows = out.trim().split(/\r?\n/).filter(Boolean).map((l) => l.split(/\s+/));
+  const peeled = rows.find((r) => r[1]?.endsWith('^{}'));
+  return (peeled ?? rows[0])?.[0] ?? '';
+}
+
+/** Read-only: the PR for a branch or URL. null means "no such PR"; any other failure throws. */
+export async function ghPrView(cwd: string, ref: string): Promise<PrInfo | null> {
+  const r = await runProcess({
+    command: 'gh',
+    args: ['pr', 'view', ref, '--json', 'url,state,headRefOid,mergeCommit'],
+    cwd,
+    timeoutMs: 30_000,
+  });
+  if (r.timedOut || r.aborted || r.error) throw new GitError('gh pr view did not complete', null);
+  if (r.code !== 0) {
+    if (/no pull requests? found/i.test(r.stderr + r.stdout)) return null;
+    throw new GitError(`gh pr view failed: ${(r.stderr || r.stdout).trim()}`, r.code);
+  }
+  try {
+    const j = JSON.parse(r.stdout) as { url: string; state: PrInfo['state']; headRefOid: string; mergeCommit?: { oid?: string } | null };
+    return { url: j.url, state: j.state, headSha: j.headRefOid, mergeCommit: j.mergeCommit?.oid ?? '' };
+  } catch {
+    throw new GitError('gh pr view returned something unreadable', null);
+  }
+}
+
+/**
+ * Every operation that talks to a remote. The pipeline and the recovery checks call these
+ * through one object so tests can substitute fakes and never reach a real remote or GitHub.
+ */
+export interface RemoteOps {
+  push(cwd: string, remote: string, branch: string): Promise<void>;
+  pushTag(cwd: string, remote: string, tag: string): Promise<void>;
+  fetchRemote(cwd: string, remote: string): Promise<void>;
+  ghAvailable(cwd: string): Promise<boolean>;
+  ghCreatePr(cwd: string, o: { base: string; head: string; title: string; body: string; draft: boolean }): Promise<string>;
+  ghMarkReady(cwd: string, pr: string): Promise<void>;
+  ghMergePr(cwd: string, pr: string, headSha: string): Promise<void>;
+  ghMergeCommit(cwd: string, pr: string): Promise<string>;
+  remoteBranchSha(cwd: string, remote: string, branch: string): Promise<string>;
+  remoteTagTarget(cwd: string, remote: string, tag: string): Promise<string>;
+  ghPrView(cwd: string, ref: string): Promise<PrInfo | null>;
+}
+
+export const realRemoteOps: RemoteOps = {
+  push, pushTag, fetchRemote, ghAvailable, ghCreatePr, ghMarkReady, ghMergePr, ghMergeCommit, remoteBranchSha, remoteTagTarget, ghPrView,
+};

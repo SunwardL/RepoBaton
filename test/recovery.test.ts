@@ -296,7 +296,7 @@ test('restart leaves a CLI-started run alone and refuses to resume a run that is
   }
 });
 
-test('acknowledge: after a human checks an interrupted publish step, the marker clears and resume is allowed', async () => {
+test('an interrupted publish step blocks resume, and a bare claim without remote proof cannot clear it', async () => {
   const repo = await makeRepo();
   const regFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'rb-home-')), 'projects.json');
   await new ProjectRegistry(regFile).add(repo);
@@ -310,9 +310,11 @@ test('acknowledge: after a human checks an interrupted publish step, the marker 
     const row = (await s.call('GET', `/api/projects/${s.projectId}/runs`)).json.runs.find((r: any) => r.id === 'pub');
     assert.equal(row.publishInFlight, 'push', 'the UI can warn about it');
 
-    assert.equal((await s.call('POST', `/api/projects/${s.projectId}/runs/pub/acknowledge`, { completed: false })).status, 200);
-    assert.equal((await store.load('pub')).publish.inFlight, undefined);
-    assert.equal((await s.call('POST', `/api/projects/${s.projectId}/runs/pub/acknowledge`, {})).status, 409, 'nothing left to acknowledge');
+    // This run has no approved commit, so there is nothing to compare a remote against: refused, marker kept.
+    const claim = await s.call('POST', `/api/projects/${s.projectId}/runs/pub/check`, { completed: false });
+    assert.equal(claim.status, 409);
+    assert.equal(claim.json.error.code, 'no-commit');
+    assert.equal((await store.load('pub')).publish.inFlight, 'push', 'the marker is still there');
   } finally {
     await s.srv.close();
   }

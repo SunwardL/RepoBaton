@@ -1,3 +1,4 @@
+import { redactDiagnostic } from './redact.ts';
 export type StageName = 'plan' | 'implement' | 'review' | 'release';
 export type Access = 'read-only' | 'workspace-write';
 export type AgentType =
@@ -146,7 +147,7 @@ export class AgentError extends Error {
   retryable: boolean;
   kind: AgentErrorKind;
   constructor(message: string, retryable = true, kind: AgentErrorKind = 'unknown') {
-    super(message);
+    super(redactDiagnostic(message));
     this.name = 'AgentError';
     this.retryable = retryable;
     this.kind = kind;
@@ -241,6 +242,8 @@ export interface PublishState {
    * the operation happened, so recovery stops and asks a human to check.
    */
   inFlight?: 'push' | 'pr' | 'merge' | 'tag';
+  /** The tag name, recorded before the tag operation starts, so recovery knows which tag to look for. */
+  pendingTag?: string;
 }
 
 export interface RunState {
@@ -270,6 +273,8 @@ export interface RunState {
   plan?: Plan;
   planAgent?: string;
   planApproved?: boolean;
+  /** Increments each time a new plan is stored; approve and reject must name the version the user saw. */
+  planVersion?: number;
   extraRounds?: number;
   /** Human guidance injected into the next implement round. */
   pendingFeedback?: string;
