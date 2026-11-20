@@ -1,6 +1,6 @@
 {
   "name": "repobaton",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Orchestrate Codex, Claude Code and OpenAI/Anthropic-compatible models through plan -> implement -> review -> release.",
   "type": "module",
   "license": "MIT",
@@ -18,9 +18,13 @@
   ],
   "scripts": {
     "dev": "node src/cli.ts",
-    "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json",
-    "test": "node --test --test-timeout=120000 \"test/*.test.ts\""
+    "typecheck": "tsc --noEmit && npm --prefix web run typecheck",
+    "build:server": "tsc -p tsconfig.build.json",
+    "build:web": "npm --prefix web run build && node scripts/copy-web.mjs",
+    "build": "npm run build:server && npm run build:web",
+    "install:web": "npm --prefix web install --no-audit --no-fund",
+    "test": "node --test --test-timeout=120000 \"test/*.test.ts\"",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "yaml": "^2.6.0"

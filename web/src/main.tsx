@@ -1,0 +1,148 @@
+import { StrictMode, useCallback, useEffect, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { api, ApiError, hasToken, initApi, type Project } from './api';
+import { ProjectView } from './ProjectView';
+import { RunView } from './RunView';
+import { errorText, useToast } from './common';
+import './styles.css';
+
+initApi();
+
+interface Route {
+  project?: string;
+  run?: string;
+}
+
+function parseRoute(): Route {
+  const m = /^#\/p\/([^/]+)(?:\/r\/([^/]+))?/.exec(window.location.hash);
+  return m ? { project: decodeURIComponent(m[1]), run: m[2] ? decodeURIComponent(m[2]) : undefined } : {};
+}
+
+export function go(project?: string, run?: string): void {
+  window.location.hash = project ? `#/p/${encodeURIComponent(project)}${run ? `/r/${encodeURIComponent(run)}` : ''}` : '#/';
+}
+
+function App() {
+  const [projects, setProjects] = useState<Project[] | null>(null);
+  const [fatal, setFatal] = useState<string | null>(null);
+  const [route, setRoute] = useState<Route>(parseRoute());
+  const [adding, setAdding] = useState('');
+  const toast = useToast();
+
+  const refresh = useCallback(async () => {
+    try {
+      setProjects((await api.projects()).projects);
+      setFatal(null);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) setFatal('token');
+      else setFatal(errorText(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    const onHash = (): void => setRoute(parseRoute());
+    window.addEventListener('hashchange', onHash);
+    void refresh();
+    const t = window.setInterval(refresh, 2500);
+    return () => {
+      window.removeEventListener('hashchange', onHash);
+      window.clearInterval(t);
+    };
+  }, [refresh]);
+
+  // Open the first project when none is chosen yet.
+  useEffect(() => {
+    if (projects && projects.length && !route.project) go(projects[0].id);
+  }, [projects, route.project]);
+
+  if (!hasToken() || fatal === 'token') {
+    return (
+      <div className="card gate">
+        <h1>需要重新打开</h1>
+        <p className="muted" style={{ marginTop: 8 }}>
+          这个页面没有有效的访问令牌。请回到运行 <code>repobaton ui</code> 的终端,用它打印的完整地址(带 <code>#token=…</code>)重新打开。每次启动的令牌都不同。
+        </p>
+      </div>
+    );
+  }
+
+  if (fatal) {
+    return (
+      <div className="card gate" role="alert">
+        <h1>连不上本地服务</h1>
+        <p className="muted" style={{ marginTop: 8 }}>{fatal}</p>
+        <div className="actions"><button className="btn p" onClick={() => void refresh()}>重试</button></div>
+      </div>
+    );
+  }
+
+  const addProject = async (): Promise<void> => {
+    const path = adding.trim();
+    if (!path) return;
+    try {
+      const { project } = await api.addProject(path);
+      setAdding('');
+      // Navigate first: a refresh that finishes later must not pull the user back from wherever they went.
+      go(project.id);
+      toast.show(`已添加项目 ${project.name}`);
+      await refresh();
+    } catch (e) {
+      toast.show(errorText(e), 'err');
+    }
+  };
+
+  const current = projects?.find((p) => p.id === route.project);
+
+  return (
+    <div className="app">
+      <aside className="side" aria-label="项目">
+        <div className="brand">
+          <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><rect x="9.5" y="1" width="5" height="22" rx="2.5" transform="rotate(35 12 12)" fill="#fff" /><circle cx="18.5" cy="5.5" r="3.2" fill="#6C8CFF" /></svg>
+          RepoBaton
+        </div>
+        <div>
+          <h2>项目</h2>
+          <div className="plist">
+            {projects?.map((p) => (
+              <button key={p.id} className={`pitem ${p.id === route.project ? 'on' : ''}`} onClick={() => go(p.id)} title={p.root}>
+                <span className={`dot ${!p.available ? 'gone' : p.busy ? 'busy' : ''}`} aria-hidden="true" />
+                <span className="nm">{p.name}</span>
+                {p.needsAttention > 0 ? <span className="badge" title="需要你处理的任务">{p.needsAttention}</span> : null}
+              </button>
+            ))}
+            {projects && projects.length === 0 ? <p style={{ padding: '4px 10px', fontSize: 13 }}>还没有项目</p> : null}
+          </div>
+        </div>
+        <div className="addrow add">
+          <h2 style={{ padding: 0 }}>添加项目</h2>
+          <input
+            aria-label="项目路径"
+            placeholder="D:\\workspace\\my-repo"
+            value={adding}
+            onChange={(e) => setAdding(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void addProject(); }}
+          />
+          <button className="btn sm" onClick={() => void addProject()} disabled={!adding.trim()}>添加</button>
+        </div>
+      </aside>
+      <main>
+        {projects === null ? (
+          <p className="muted">加载中…</p>
+        ) : !current ? (
+          <div className="empty"><h2>选择或添加一个项目</h2>在左侧输入一个本地 Git 仓库的路径。同一个仓库的子目录或工作区会被识别为同一个项目。</div>
+        ) : route.run ? (
+          <RunView key={`${current.id}/${route.run}`} projectId={current.id} runId={route.run} notify={toast.show} onBack={() => go(current.id)} />
+        ) : (
+          <ProjectView key={current.id} project={current} onOpenRun={(id) => go(current.id, id)} onChanged={refresh} toast={toast.show} />
+        )}
+      </main>
+      {toast.node}
+    </div>
+  );
+}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);

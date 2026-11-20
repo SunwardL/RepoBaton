@@ -20,6 +20,8 @@ import { exists, formatDuration } from './util.ts';
 const HELP = `repobaton - let Codex, Claude Code and API models work on one task as planner / implementer / reviewer / release manager
 
 Usage:
+  repobaton ui [--port <n>] [--no-open] [--project <dir>]...
+                                           open the local web UI (127.0.0.1 only) to manage several projects
   repobaton init [--force]                 detect local CLIs, write repobaton.yaml
   repobaton doctor                         check CLIs, API keys, git, gh and the config
   repobaton run "<task>" [options]         run plan -> implement -> test -> review -> release
@@ -57,7 +59,7 @@ Without a terminal (pipes, CI, a UI), a run that needs plan approval always paus
 at "awaiting-plan-approval"; it is never approved automatically.
 `;
 
-type Flags = Record<string, string | boolean | string[] | undefined>;
+type Flags = Record<string, string | boolean | (string | boolean)[] | undefined>;
 
 const OPTIONS = {
   config: { type: 'string' },
@@ -87,6 +89,9 @@ const OPTIONS = {
   force: { type: 'boolean' },
   json: { type: 'boolean' },
   follow: { type: 'boolean', short: 'f' },
+  port: { type: 'string' },
+  'no-open': { type: 'boolean' },
+  project: { type: 'string', multiple: true },
   verbose: { type: 'boolean', short: 'v' },
   quiet: { type: 'boolean', short: 'q' },
   help: { type: 'boolean', short: 'h' },
@@ -170,6 +175,7 @@ function exitCodeFor(s: RunState): number {
     case 'succeeded':
       return 0;
     case 'needs-human':
+    case 'interrupted':
     case 'awaiting-plan-approval':
       return 3;
     case 'cancelled':
@@ -366,6 +372,30 @@ async function cmdCleanup(f: Flags, positional: string[]): Promise<void> {
   process.stdout.write('worktree removed\n');
 }
 
+async function cmdUi(f: Flags): Promise<number> {
+  const port = typeof f.port === 'string' ? Number(f.port) : undefined;
+  if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) fail('--port must be 0-65535');
+  const explicit = Array.isArray(f.project) ? f.project.filter((x): x is string => typeof x === 'string') : [];
+  // Open the current directory's repository too, when there is one, so "repobaton ui" in a project just works.
+  const projects = [...explicit];
+  if (!explicit.length) {
+    try {
+      projects.push(await G.repoRoot(process.cwd()));
+    } catch {
+      /* not inside a repository: the project list on disk is enough */
+    }
+  }
+  const { runUi } = await import('./ui.ts');
+  const server = await runUi({ port, projects, open: !f['no-open'] }).catch((e: Error) => fail(e.message, 1));
+  await new Promise<void>((resolve) => {
+    const stop = (): void => resolve();
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  });
+  await server.close();
+  return 0;
+}
+
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
@@ -391,6 +421,8 @@ async function main(): Promise<number> {
     return 0;
   }
   switch (cmd) {
+    case 'ui':
+      return cmdUi(f);
     case 'init':
       await cmdInit(f);
       return 0;
