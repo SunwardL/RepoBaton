@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
 import { AGENT_TYPES, STAGE_NAMES, type AgentConfig, type Config, type StageName } from './types.ts';
+import { registerSecret } from './redact.ts';
 import { exists } from './util.ts';
 
 export const CONFIG_FILENAMES = ['repobaton.yaml', 'repobaton.yml', '.repobaton.yaml'];
@@ -144,6 +145,8 @@ export async function loadConfig(repo: string, explicit?: string): Promise<Loade
   const config = merge(base, user);
   const { errors, warnings } = splitProblems(validateConfig(config));
   if (errors.length) throw new ConfigError(errors);
+  // An inline apiKey is a secret value too: make sure no error text can echo it back.
+  for (const a of Object.values(config.agents)) registerSecret(a.apiKey);
   return { config, file, warnings };
 }
 

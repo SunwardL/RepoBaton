@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { redactDeep, redactDiagnostic } from './redact.ts';
 import type { RunState } from './types.ts';
 import { ensureDir, exists, nowIso, readJson, writeFileAtomic, writeJson } from './util.ts';
 
@@ -22,7 +23,7 @@ export class RunStore {
   }
   async save(state: RunState): Promise<void> {
     state.updatedAt = nowIso();
-    await writeJson(path.join(this.dir(state.id), 'state.json'), state);
+    await writeJson(path.join(this.dir(state.id), 'state.json'), redactDeep(state, { assignments: true }));
   }
   async load(id: string): Promise<RunState> {
     const file = path.join(this.dir(id), 'state.json');
@@ -56,7 +57,7 @@ export class RunStore {
   async artifact(id: string, name: string, content: string): Promise<string> {
     const file = path.join(this.dir(id), 'artifacts', name);
     await ensureDir(path.dirname(file));
-    await writeFileAtomic(file, content);
+    await writeFileAtomic(file, redactDiagnostic(content));
     return file;
   }
 }

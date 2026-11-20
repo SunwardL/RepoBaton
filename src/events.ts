@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { redactDeep, redactDiagnostic } from './redact.ts';
 import { ensureDir, exists, nowIso } from './util.ts';
 
 /**
@@ -76,8 +77,8 @@ export class FileEventSink implements EventSink {
       runId: this.runId,
       type,
       stage: extra.stage,
-      message,
-      data: extra.data,
+      message: redactDiagnostic(message),
+      data: extra.data ? redactDeep(extra.data, { assignments: true }) : undefined,
     };
     const line = JSON.stringify(event) + '\n';
     // Serialised appends keep lines whole and ordered even under concurrent emits.

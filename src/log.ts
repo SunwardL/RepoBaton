@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { redactDiagnostic } from './redact.ts';
 import { stripAnsi } from './util.ts';
 
 export interface Logger {
@@ -18,13 +19,13 @@ export function createLogger(opts: { file?: string; quiet?: boolean; verbose?: b
   const write = (level: string, msg: string): void => {
     if (!opts.file) return;
     try {
-      appendFileSync(opts.file, `${new Date().toISOString()} ${level} ${stripAnsi(msg)}\n`);
+      appendFileSync(opts.file, `${new Date().toISOString()} ${level} ${redactDiagnostic(stripAnsi(msg))}\n`);
     } catch {
       /* logging must never break a run */
     }
   };
   const out = (s: string): void => {
-    if (!opts.quiet) process.stderr.write(s + '\n');
+    if (!opts.quiet) process.stderr.write(redactDiagnostic(s) + '\n');
   };
   return {
     info(msg) {
