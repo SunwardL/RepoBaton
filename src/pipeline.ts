@@ -48,6 +48,8 @@ export interface PipelineOptions {
   approvePlan?: (plan: Plan) => Promise<{ approved: true } | { approved: false; feedback: string }>;
   /** Override the configured publish actions for this run. */
   publishOverride?: Partial<Config['publish']>;
+  /** Stamped onto every run this pipeline executes. Set by the local server, never by the CLI. */
+  owner?: NonNullable<RunState['owner']>;
 }
 
 export interface ResumeOptions {
@@ -102,6 +104,7 @@ export class Pipeline {
       rounds: [],
       publish: {},
       usage: { costUsd: 0, inputTokens: 0, outputTokens: 0, calls: 0 },
+      owner: this.opts.owner,
     };
     await this.store.save(state);
     await this.openEvents(state);
@@ -130,6 +133,11 @@ export class Pipeline {
     }
     state.status = 'running';
     state.error = undefined;
+    state.errorKind = undefined;
+    state.errorAgent = undefined;
+    state.interruptedAt = undefined;
+    // A standalone CLI resume clears the owner: nothing server-side is executing it any more.
+    state.owner = this.opts.owner;
     await this.store.save(state);
     await this.openEvents(state);
     this.events.emit('run.resumed', `resuming from ${state.stage ?? 'the start'}`, {
@@ -654,7 +662,24 @@ export class Pipeline {
     await this.publish(state, sha);
   }
 
+  /** Record, on disk, that an external operation is about to start. */
+  private async markInFlight(state: RunState, op: NonNullable<RunState['publish']['inFlight']>): Promise<void> {
+    state.publish.inFlight = op;
+    await this.store.save(state);
+  }
+
   private async publish(state: RunState, approvedSha: string): Promise<void> {
+    if (state.publish.inFlight) {
+      // A previous attempt died between "about to do X" and "X is recorded". Repeating X could
+      // push twice, open a second PR or merge something unreviewed, so stop and ask a human.
+      const op = state.publish.inFlight;
+      throw new PipelineError(
+        `the previous attempt was interrupted while doing "${op}", and it is unknown whether it completed. ` +
+          `Check the remote (branch ${state.branch ?? ''}${state.publish.prUrl ? `, ${state.publish.prUrl}` : ''}), ` +
+          `then clear the marker with "Mark as checked" and resume.`,
+        'needs-human',
+      );
+    }
     const p = this.cfg.publish;
     if (!p.push && !p.createPr && !p.merge && !p.tag) {
       this.log.stage('publish', `nothing to publish (all publish actions off). Branch ${state.branch} is ready in ${state.worktree}`);
@@ -673,13 +698,16 @@ export class Pipeline {
 
     if (p.push && !state.publish.pushed) {
       if (!(await G.remoteUrl(this.repo, p.remote))) throw new PipelineError(`remote "${p.remote}" is not configured`, 'needs-human');
+      await this.markInFlight(state, 'push');
       await G.push(wt, p.remote, branch);
+      state.publish.inFlight = undefined;
       state.publish.pushed = true;
       this.log.stage('publish', `pushed ${branch} to ${p.remote}`);
       await this.store.save(state);
     }
     if (p.createPr && !state.publish.prUrl) {
       if (!(await G.ghAvailable(wt))) throw new PipelineError('publish.createPr needs the GitHub CLI ("gh") installed and logged in', 'needs-human');
+      await this.markInFlight(state, 'pr');
       state.publish.prUrl = await G.ghCreatePr(wt, {
         base: state.base!.branch,
         head: branch,
@@ -687,13 +715,16 @@ export class Pipeline {
         body: rel.pr_body,
         draft: p.draftPr && !p.merge,
       });
+      state.publish.inFlight = undefined;
       this.log.stage('publish', `PR ${state.publish.prUrl}`);
       await this.store.save(state);
     }
     if (p.merge && !state.publish.merged) {
       const pr = state.publish.prUrl!;
+      await this.markInFlight(state, 'merge');
       await G.ghMarkReady(wt, pr);
       await G.ghMergePr(wt, pr, approvedSha);
+      state.publish.inFlight = undefined;
       state.publish.merged = true;
       state.publish.mergeSha = (await G.ghMergeCommit(wt, pr)) || undefined;
       this.log.stage('publish', `merged ${pr}`);
@@ -717,9 +748,11 @@ export class Pipeline {
     await G.fetchRemote(root, p.remote);
     const sha = state.publish.mergeSha;
     if (!sha) throw new PipelineError('cannot tag: merge commit is unknown', 'needs-human');
+    await this.markInFlight(state, 'tag');
     await G.createTag(root, tag, sha, rel.release_notes || tag);
     state.publish.tag = tag;
     await G.pushTag(root, p.remote, tag);
+    state.publish.inFlight = undefined;
     state.publish.tagPushed = true;
     this.log.stage('publish', `tagged ${tag} @ ${sha.slice(0, 8)}`);
     await this.store.save(state);

@@ -21,6 +21,7 @@ export interface RunEvent {
 export type EventType =
   | 'run.started'
   | 'run.resumed'
+  | 'run.interrupted'
   | 'run.finished'
   | 'stage.started'
   | 'stage.finished'
@@ -110,7 +111,7 @@ export async function readEvents(file: string, afterSeq = 0): Promise<RunEvent[]
 }
 
 /** Statuses after which a run writes no more events until someone resumes it. */
-export const SETTLED_STATUSES = ['succeeded', 'failed', 'cancelled', 'needs-human', 'awaiting-plan-approval'];
+export const SETTLED_STATUSES = ['succeeded', 'failed', 'cancelled', 'needs-human', 'awaiting-plan-approval', 'interrupted'];
 
 export interface FollowOptions {
   /** Only deliver events with seq greater than this. */

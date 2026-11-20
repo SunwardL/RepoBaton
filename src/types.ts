@@ -224,7 +224,9 @@ export type RunStatus =
   | 'succeeded'
   | 'needs-human'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  /** The server that was executing this run is gone and nothing is executing it now. */
+  | 'interrupted';
 
 export interface PublishState {
   pushed?: boolean;
@@ -233,6 +235,12 @@ export interface PublishState {
   mergeSha?: string;
   tag?: string;
   tagPushed?: boolean;
+  /**
+   * Set just before an external side effect (push, PR, merge, tag) and cleared once its
+   * result is recorded. If a run is interrupted while this is set, nobody can tell whether
+   * the operation happened, so recovery stops and asks a human to check.
+   */
+  inFlight?: 'push' | 'pr' | 'merge' | 'tag';
 }
 
 export interface RunState {
@@ -250,6 +258,14 @@ export interface RunState {
   base?: { branch: string; sha: string };
   branch?: string;
   worktree?: string;
+  /**
+   * Set only when a local server launches the run. It names the server instance, so a later
+   * server can tell "mine, still executing", "an earlier server's, now gone" and "no server
+   * involved at all" (a standalone CLI run) apart.
+   */
+  owner?: { serverId: string; pid: number; startedAt: string };
+  /** When the run was marked interrupted. */
+  interruptedAt?: string;
   setupDone?: boolean;
   plan?: Plan;
   planAgent?: string;
