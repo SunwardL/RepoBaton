@@ -37,6 +37,7 @@ abstract class CliAgent implements Agent {
         throw new AgentError(
           `${hint}. Set agents.${this.id}.path, REPOBATON_${this.kind.toUpperCase()}_PATH, or run "repobaton doctor".`,
           false,
+          'not-found',
         );
       }
       this.found = d;
@@ -96,9 +97,9 @@ export class ClaudeCliAgent extends CliAgent {
       shell,
       onStderrLine: (l) => req.onProgress?.(stripAnsi(l)),
     });
-    if (r.aborted) throw new AgentError('cancelled', false);
-    if (r.timedOut) throw new AgentError(`claude timed out after ${Math.round(req.timeoutMs / 1000)}s`);
-    if (r.error) throw new AgentError(`failed to start claude: ${r.error}`, false);
+    if (r.aborted) throw new AgentError('cancelled', false, 'cancelled');
+    if (r.timedOut) throw new AgentError(`claude timed out after ${Math.round(req.timeoutMs / 1000)}s`, true, 'timeout');
+    if (r.error) throw new AgentError(`failed to start claude: ${r.error}`, false, 'not-found');
 
     let payload: any;
     try {
@@ -114,7 +115,8 @@ export class ClaudeCliAgent extends CliAgent {
     }
     if (payload.is_error || (r.code !== 0 && payload.subtype !== 'success')) {
       const msg = typeof payload.result === 'string' ? payload.result : payload.subtype;
-      throw new AgentError(`claude reported an error: ${msg}`, !/auth|login|credit|permission/i.test(String(msg)));
+      const isAuth = /auth|login|credit|permission|api key|unauthorized|401|403/i.test(String(msg));
+      throw new AgentError(`claude reported an error: ${msg}`, !isAuth, isAuth ? 'auth' : /rate.?limit|429|overloaded/i.test(String(msg)) ? 'rate-limit' : 'unknown');
     }
     const text = typeof payload.result === 'string' ? payload.result : '';
     let structured = payload.structured_output;
@@ -123,7 +125,7 @@ export class ClaudeCliAgent extends CliAgent {
       try {
         structured = extractJson(text);
       } catch {
-        throw new AgentError('claude returned no structured_output for a schema request');
+        throw new AgentError('claude returned no structured_output for a schema request', true, 'bad-output');
       }
     }
     return {
@@ -193,9 +195,9 @@ export class CodexCliAgent extends CliAgent {
           }
         },
       });
-      if (r.aborted) throw new AgentError('cancelled', false);
-      if (r.timedOut) throw new AgentError(`codex timed out after ${Math.round(req.timeoutMs / 1000)}s`);
-      if (r.error) throw new AgentError(`failed to start codex: ${r.error}`, false);
+      if (r.aborted) throw new AgentError('cancelled', false, 'cancelled');
+      if (r.timedOut) throw new AgentError(`codex timed out after ${Math.round(req.timeoutMs / 1000)}s`, true, 'timeout');
+      if (r.error) throw new AgentError(`failed to start codex: ${r.error}`, false, 'not-found');
 
       const failed = events.find((e) => e.type === 'turn.failed' || e.type === 'error');
       const messages = events
@@ -208,7 +210,8 @@ export class CodexCliAgent extends CliAgent {
           failed?.message ??
           tail(stripAnsi(r.stderr), 600) ??
           `exit ${r.code}`;
-        throw new AgentError(`codex failed: ${reason}`, !/auth|login|sign in|credit|quota/i.test(String(reason)));
+        const isAuth = /auth|login|sign in|credit|quota|api key|unauthorized|401|403/i.test(String(reason));
+        throw new AgentError(`codex failed: ${reason}`, !isAuth, isAuth ? 'auth' : /rate.?limit|429/i.test(String(reason)) ? 'rate-limit' : 'unknown');
       }
       const text = messages[messages.length - 1] ?? '';
       let structured: unknown;
@@ -216,7 +219,7 @@ export class CodexCliAgent extends CliAgent {
         try {
           structured = extractJson(text);
         } catch {
-          throw new AgentError('codex final message was not valid JSON for a schema request');
+          throw new AgentError('codex final message was not valid JSON for a schema request', true, 'bad-output');
         }
       }
       const thread = events.find((e) => e.type === 'thread.started');

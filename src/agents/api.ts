@@ -1,6 +1,7 @@
 import { resolveApiKey } from '../config.ts';
 import {
   AgentError,
+  type AgentErrorKind,
   type Agent,
   type AgentConfig,
   type AgentResult,
@@ -32,17 +33,36 @@ async function postJson(
     const text = await res.text();
     if (!res.ok) {
       const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
-      throw new AgentError(`HTTP ${res.status} from ${url}: ${text.slice(0, 500)}`, retryable);
+      const kind: AgentErrorKind =
+        res.status === 401 || res.status === 403
+          ? 'auth'
+          : res.status === 429
+            ? 'rate-limit'
+            : res.status === 404
+              ? 'not-found'
+              : res.status === 408
+                ? 'timeout'
+                : 'unknown';
+      throw new AgentError(`HTTP ${res.status} from ${url}: ${text.slice(0, 500)}`, retryable, kind);
     }
     try {
       return JSON.parse(text);
     } catch {
-      throw new AgentError(`non-JSON response from ${url}: ${text.slice(0, 300)}`);
+      throw new AgentError(`non-JSON response from ${url}: ${text.slice(0, 300)}`, true, 'bad-output');
     }
   } catch (e) {
     if (e instanceof AgentError) throw e;
-    if (outer?.aborted) throw new AgentError('cancelled', false);
-    throw new AgentError(`request to ${url} failed: ${(e as Error).message}`);
+    if (outer?.aborted) throw new AgentError('cancelled', false, 'cancelled');
+    // Node's fetch hides the real reason in `cause` ("fetch failed" alone tells the user nothing).
+    const cause = (e as Error & { cause?: { code?: string; message?: string } }).cause;
+    const reason = cause?.code ?? cause?.message ?? (e as Error).message;
+    // Our own timer aborts with the message "timeout"; everything else is a transport failure.
+    const timedOut = ctrl.signal.aborted && String((ctrl.signal.reason as Error | undefined)?.message) === 'timeout';
+    throw new AgentError(
+      `request to ${url} failed: ${reason}`,
+      true,
+      timedOut ? 'timeout' : 'network',
+    );
   } finally {
     clearTimeout(timer);
     outer?.removeEventListener('abort', onAbort);
@@ -78,6 +98,7 @@ abstract class ApiAgent implements Agent {
       throw new AgentError(
         `no API key for agent "${this.id}": set ${this.cfg.apiKeyEnv ?? this.keyEnv} in the environment`,
         false,
+        'auth',
       );
     }
     return k;
@@ -106,12 +127,12 @@ abstract class ApiAgent implements Agent {
       try {
         structured = extractJson(text);
       } catch {
-        throw new AgentError(`model did not return JSON matching the schema: ${text.slice(0, 200)}`);
+        throw new AgentError(`model did not return JSON matching the schema: ${text.slice(0, 200)}`, true, 'bad-output');
       }
     }
     if (req.schema) {
       const errs = validateSchema(req.schema, structured);
-      if (errs.length) throw new AgentError(`model JSON failed schema validation: ${errs.slice(0, 4).join('; ')}`);
+      if (errs.length) throw new AgentError(`model JSON failed schema validation: ${errs.slice(0, 4).join('; ')}`, true, 'bad-output');
     }
     return {
       text,
@@ -132,7 +153,7 @@ export class OpenAiCompatibleAgent extends ApiAgent {
   async run(req: AgentRunRequest): Promise<AgentResult> {
     const started = Date.now();
     const model = req.model ?? this.cfg.model;
-    if (!model) throw new AgentError(`agent "${this.id}" has no model configured`, false);
+    if (!model) throw new AgentError(`agent "${this.id}" has no model configured`, false, 'not-found');
     const key = this.key();
     const url = joinUrl(this.cfg.baseUrl ?? this.defaultBase, '/chat/completions');
     const headers = { authorization: `Bearer ${key}`, ...(this.cfg.headers ?? {}) };
@@ -148,7 +169,7 @@ export class OpenAiCompatibleAgent extends ApiAgent {
     let outTok = 0;
     for (let step = 0; step < maxSteps; step++) {
       const remaining = req.timeoutMs - (Date.now() - started);
-      if (remaining <= 0) throw new AgentError('API agent timed out');
+      if (remaining <= 0) throw new AgentError('API agent timed out', true, 'timeout');
       const body: Record<string, unknown> = { model, messages, tools, max_tokens: this.cfg.maxTokens ?? 8192 };
       if (this.cfg.temperature !== undefined) body.temperature = this.cfg.temperature;
       const effort = req.effort ?? this.cfg.effort;
@@ -157,7 +178,7 @@ export class OpenAiCompatibleAgent extends ApiAgent {
       inTok += res.usage?.prompt_tokens ?? 0;
       outTok += res.usage?.completion_tokens ?? 0;
       const msg = res.choices?.[0]?.message;
-      if (!msg) throw new AgentError(`unexpected response shape: ${JSON.stringify(res).slice(0, 300)}`);
+      if (!msg) throw new AgentError(`unexpected response shape: ${JSON.stringify(res).slice(0, 300)}`, true, 'bad-output');
       messages.push(msg);
       const calls: any[] = msg.tool_calls ?? [];
       if (calls.length === 0) {
@@ -192,7 +213,7 @@ export class AnthropicCompatibleAgent extends ApiAgent {
   async run(req: AgentRunRequest): Promise<AgentResult> {
     const started = Date.now();
     const model = req.model ?? this.cfg.model;
-    if (!model) throw new AgentError(`agent "${this.id}" has no model configured`, false);
+    if (!model) throw new AgentError(`agent "${this.id}" has no model configured`, false, 'not-found');
     const key = this.key();
     const base = (this.cfg.baseUrl ?? this.defaultBase).replace(/\/+$/, '');
     const url = joinUrl(base, base.endsWith('/v1') ? '/messages' : '/v1/messages');
@@ -219,7 +240,7 @@ export class AnthropicCompatibleAgent extends ApiAgent {
     let outTok = 0;
     for (let step = 0; step < maxSteps; step++) {
       const remaining = req.timeoutMs - (Date.now() - started);
-      if (remaining <= 0) throw new AgentError('API agent timed out');
+      if (remaining <= 0) throw new AgentError('API agent timed out', true, 'timeout');
       const body: Record<string, unknown> = {
         model,
         messages,

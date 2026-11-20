@@ -129,3 +129,94 @@ test('plan approval pauses the run until approved', async () => {
   assert.equal(done.status, 'succeeded', done.error);
   assert.equal(coder.calls.length, 1);
 });
+
+function approvalPipe(repo: string, agents: Record<string, Fake>, opts: { interactive?: Array<{ approved: true } | { approved: false; feedback: string }> } = {}): Pipeline {
+  const config = defaultConfig();
+  config.agents = { planner: { type: 'command', command: 'x' }, coder: { type: 'command', command: 'x' }, judge: { type: 'command', command: 'x' } };
+  config.stages.plan.agent = 'planner';
+  config.stages.plan.requireApproval = true;
+  config.stages.implement.agent = 'coder';
+  config.stages.review.agent = 'judge';
+  config.stages.release.agent = 'judge';
+  config.stages.implement.retries = 0;
+  config.test.setup = '';
+  config.test.command = 'node -e "process.exit(0)"';
+  const registry = { get: (id: string) => agents[id] } as unknown as AgentRegistry;
+  const queue = opts.interactive ? [...opts.interactive] : undefined;
+  return new Pipeline({
+    repo,
+    config,
+    registry,
+    approvePlan: queue ? async () => queue.shift() ?? { approved: true } : undefined,
+  });
+}
+
+function happyAgents(planPrompts: string[]): Record<string, Fake> {
+  const planner = new Fake('planner', (req) => {
+    planPrompts.push(req.prompt);
+    return plan;
+  });
+  const coder = new Fake('coder', async (req) => {
+    await fs.writeFile(path.join(req.cwd, 'value.txt'), 'good\n');
+    return 'done';
+  });
+  const judgeAgent = new Fake('judge', (req) =>
+    req.prompt.includes('RELEASE MANAGER') ? release : { verdict: 'approve', summary: 'ok', issues: [] },
+  );
+  return { planner, coder, judge: judgeAgent };
+}
+
+test('rejecting a paused plan sends the feedback to the planner, not the implementer', async () => {
+  const repo = await makeRepo();
+  const planPrompts: string[] = [];
+  const agents = happyAgents(planPrompts);
+  const pipe = approvalPipe(repo, agents);
+  const paused = await pipe.start('make value good');
+  assert.equal(paused.status, 'awaiting-plan-approval');
+  assert.equal(planPrompts.length, 1);
+
+  const again = await pipe.rejectPlan(paused.id, 'split step 1 into two steps');
+  assert.equal(again.status, 'awaiting-plan-approval', 'a revised plan must wait for approval again');
+  assert.equal(planPrompts.length, 2);
+  assert.match(planPrompts[1], /split step 1 into two steps/);
+  assert.equal((agents.coder as Fake).calls.length, 0, 'implementation must not start before approval');
+
+  const done = await pipe.resume(again.id, { approvePlan: true });
+  assert.equal(done.status, 'succeeded', done.error);
+  const implPrompt = (agents.coder as Fake).calls[0].prompt;
+  assert.doesNotMatch(implPrompt, /split step 1 into two steps/, 'plan feedback must not leak into implementation');
+  assert.equal(done.pendingFeedback, undefined);
+});
+
+test('interactive rejection also reaches the planner', async () => {
+  const repo = await makeRepo();
+  const planPrompts: string[] = [];
+  const agents = happyAgents(planPrompts);
+  const pipe = approvalPipe(repo, agents, { interactive: [{ approved: false, feedback: 'add a rollback step' }, { approved: true }] });
+  const done = await pipe.start('make value good');
+  assert.equal(done.status, 'succeeded', done.error);
+  assert.equal(planPrompts.length, 2);
+  assert.match(planPrompts[1], /add a rollback step/);
+  assert.doesNotMatch((agents.coder as Fake).calls[0].prompt, /add a rollback step/);
+});
+
+test('resume --feedback on a paused plan is plan feedback, not implementer guidance', async () => {
+  const repo = await makeRepo();
+  const planPrompts: string[] = [];
+  const agents = happyAgents(planPrompts);
+  const pipe = approvalPipe(repo, agents);
+  const paused = await pipe.start('make value good');
+  const again = await pipe.resume(paused.id, { feedback: 'mention the migration' });
+  assert.equal(again.status, 'awaiting-plan-approval');
+  assert.match(planPrompts[1], /mention the migration/);
+  assert.equal((agents.coder as Fake).calls.length, 0);
+});
+
+test('a run without an interactive approver always stops at the plan', async () => {
+  const repo = await makeRepo();
+  const agents = happyAgents([]);
+  const pipe = approvalPipe(repo, agents);
+  const paused = await pipe.start('make value good');
+  assert.equal(paused.status, 'awaiting-plan-approval');
+  assert.equal((agents.coder as Fake).calls.length, 0);
+});

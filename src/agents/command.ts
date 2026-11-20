@@ -59,9 +59,9 @@ export class CommandAgent implements Agent {
       shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(found),
       onStderrLine: (l) => req.onProgress?.(stripAnsi(l)),
     });
-    if (r.aborted) throw new AgentError('cancelled', false);
-    if (r.timedOut) throw new AgentError(`${cmd} timed out`);
-    if (r.error) throw new AgentError(`failed to start ${cmd}: ${r.error}`, false);
+    if (r.aborted) throw new AgentError('cancelled', false, 'cancelled');
+    if (r.timedOut) throw new AgentError(`${cmd} timed out`, true, 'timeout');
+    if (r.error) throw new AgentError(`failed to start ${cmd}: ${r.error}`, false, 'not-found');
     if (r.code !== 0) throw new AgentError(`${cmd} exited ${r.code}: ${tail(stripAnsi(r.stderr || r.stdout), 600)}`);
     const text = stripAnsi(r.stdout).trim();
     let structured: unknown;
@@ -69,7 +69,7 @@ export class CommandAgent implements Agent {
       try {
         structured = extractJson(text);
       } catch {
-        throw new AgentError(`${cmd} output was not JSON for a schema request: ${text.slice(0, 200)}`);
+        throw new AgentError(`${cmd} output was not JSON for a schema request: ${text.slice(0, 200)}`, true, 'bad-output');
       }
     }
     return { text, structured, durationMs: r.durationMs, raw: r.stdout };

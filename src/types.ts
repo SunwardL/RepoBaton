@@ -131,12 +131,25 @@ export interface Agent {
   run(req: AgentRunRequest): Promise<AgentResult>;
 }
 
+/** Why an agent call failed. The UI maps these to actionable messages. */
+export type AgentErrorKind =
+  | 'auth' // credentials missing or rejected
+  | 'rate-limit'
+  | 'network' // unreachable, DNS, TLS, connection reset
+  | 'timeout'
+  | 'not-found' // CLI missing, model or endpoint unknown
+  | 'bad-output' // answered, but not in the required shape
+  | 'cancelled'
+  | 'unknown';
+
 export class AgentError extends Error {
   retryable: boolean;
-  constructor(message: string, retryable = true) {
+  kind: AgentErrorKind;
+  constructor(message: string, retryable = true, kind: AgentErrorKind = 'unknown') {
     super(message);
     this.name = 'AgentError';
     this.retryable = retryable;
+    this.kind = kind;
   }
 }
 
@@ -229,6 +242,9 @@ export interface RunState {
   status: RunStatus;
   stage?: string;
   error?: string;
+  /** When an agent failure ended the run: what kind, and which agent. */
+  errorKind?: AgentErrorKind;
+  errorAgent?: string;
   createdAt: string;
   updatedAt: string;
   base?: { branch: string; sha: string };
@@ -241,6 +257,8 @@ export interface RunState {
   extraRounds?: number;
   /** Human guidance injected into the next implement round. */
   pendingFeedback?: string;
+  /** Human feedback on the plan; consumed by the next planning attempt only. */
+  planFeedback?: string;
   rounds: Round[];
   release?: ReleaseDraft;
   publish: PublishState;

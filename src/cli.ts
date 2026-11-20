@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import { EOL } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import { parseArgs } from 'node:util';
@@ -8,6 +9,7 @@ import { detectProject } from './detect.ts';
 import { discoverAll } from './discover.ts';
 import * as G from './git.ts';
 import { createLogger } from './log.ts';
+import { eventsFile, followEvents, formatEventLine, SETTLED_STATUSES } from './events.ts';
 import { Pipeline } from './pipeline.ts';
 import { formatPlan, renderReport } from './report.ts';
 import { RunStore } from './store.ts';
@@ -23,7 +25,8 @@ Usage:
   repobaton run "<task>" [options]         run plan -> implement -> test -> review -> release
   repobaton resume <run|last> [options]    continue a paused/failed run
   repobaton approve <run|last>             approve a pending plan and continue
-  repobaton status [run|last]              list runs, or show one
+  repobaton reject <run|last> "<feedback>" send the plan back to the planner (pauses again for approval)
+  repobaton status [run|last] [--follow]   list runs, or show one; --follow streams its live events
   repobaton report <run|last>              print the Markdown report
   repobaton cleanup <run|last> [--delete-branch]
   repobaton config                         print the effective configuration
@@ -42,10 +45,16 @@ Run options:
   --test "<cmd>"            test command    --setup "<cmd>"   worktree setup command
   -v, --verbose             show agent progress
   -q, --quiet               only print the final result
-  --json                    print the final run state as JSON
+  --json                    print the final run state as JSON (with status --follow: one event per line)
+  -f, --follow              status: stream a run's events until it stops
 
 Resume options:
-  --more-rounds <n>   --feedback "<text>"   --plan-feedback is asked interactively when needed
+  --more-rounds <n>   --feedback "<text>"
+    --feedback on a run waiting for plan approval is feedback on the plan;
+    on any other run it is guidance for the implementer's next round.
+
+Without a terminal (pipes, CI, a UI), a run that needs plan approval always pauses
+at "awaiting-plan-approval"; it is never approved automatically.
 `;
 
 type Flags = Record<string, string | boolean | string[] | undefined>;
@@ -77,6 +86,7 @@ const OPTIONS = {
   'delete-branch': { type: 'boolean' },
   force: { type: 'boolean' },
   json: { type: 'boolean' },
+  follow: { type: 'boolean', short: 'f' },
   verbose: { type: 'boolean', short: 'v' },
   quiet: { type: 'boolean', short: 'q' },
   help: { type: 'boolean', short: 'h' },
@@ -130,13 +140,13 @@ function applyOverrides(cfg: Config, f: Flags): Config {
 
 async function askPlan(plan: Plan): Promise<{ approved: true } | { approved: false; feedback: string }> {
   process.stderr.write(`\n${formatPlan(plan)}\n\n`);
-  if (!process.stdin.isTTY) return { approved: true };
   const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   try {
     const a = (await rl.question('Approve this plan? [Y]es / [n]o, give feedback: ')).trim().toLowerCase();
     if (a === '' || a === 'y' || a === 'yes') return { approved: true };
     const fb = (await rl.question('What should change? ')).trim();
-    return fb ? { approved: false, feedback: fb } : { approved: true };
+    // An empty answer must not silently approve: ask the planner to revise instead.
+    return { approved: false, feedback: fb || 'Please revise the plan.' };
   } finally {
     rl.close();
   }
@@ -267,6 +277,16 @@ async function cmdResume(f: Flags, positional: string[], approve = false): Promi
   );
 }
 
+async function cmdReject(f: Flags, positional: string[]): Promise<number> {
+  const id = positional[0] ?? fail('missing run id (or "last")');
+  const feedback = positional.slice(1).join(' ').trim() || (typeof f.feedback === 'string' ? f.feedback.trim() : '');
+  if (!feedback) fail('missing feedback: repobaton reject <run> "what should change"');
+  const repo = await repoOf(f);
+  const loaded = await loadConfig(repo, typeof f.config === 'string' ? f.config : undefined).catch(handleConfigError);
+  const cfg = applyOverrides(loaded.config, f);
+  return runPipeline(f, repo, cfg, (p) => p.rejectPlan(id, feedback));
+}
+
 async function runPipeline(f: Flags, repo: string, cfg: Config, go: (p: Pipeline) => Promise<RunState>): Promise<number> {
   const ctrl = new AbortController();
   let interrupted = false;
@@ -283,7 +303,10 @@ async function runPipeline(f: Flags, repo: string, cfg: Config, go: (p: Pipeline
     quiet: !!f.quiet,
     verbose: !!f.verbose,
   });
-  const pipeline = new Pipeline({ repo, config: cfg, log, signal: ctrl.signal, approvePlan: askPlan });
+  // Only a real terminal can answer the approval prompt. Anything else (a UI
+  // subprocess, CI, a pipe) must pause at the plan instead of auto-approving.
+  const interactive = !!process.stdin.isTTY && !!process.stderr.isTTY && !f.json;
+  const pipeline = new Pipeline({ repo, config: cfg, log, signal: ctrl.signal, approvePlan: interactive ? askPlan : undefined });
   const state = await go(pipeline).catch((e: Error) => fail(e.message, 1));
   if (f.json) process.stdout.write(JSON.stringify(state, null, 2) + '\n');
   else process.stdout.write('\n' + summarize(state) + '\n');
@@ -304,6 +327,17 @@ async function readStdin(): Promise<string> {
 async function cmdStatus(f: Flags, positional: string[]): Promise<void> {
   const repo = await repoOf(f);
   const store = new RunStore(repo);
+  if (f.follow) {
+    const id = await store.resolve(positional[0] ?? 'last');
+    const ctrl = new AbortController();
+    process.on('SIGINT', () => ctrl.abort());
+    await followEvents(eventsFile(store.dir(id)), {
+      signal: ctrl.signal,
+      isSettled: async () => SETTLED_STATUSES.includes((await store.load(id)).status),
+      onEvent: (ev) => process.stdout.write((f.json ? JSON.stringify(ev) : formatEventLine(ev)) + EOL),
+    });
+    return;
+  }
   if (positional[0]) {
     const s = await store.load(await store.resolve(positional[0]));
     process.stdout.write(f.json ? JSON.stringify(s, null, 2) + '\n' : renderReport(s));
@@ -368,6 +402,8 @@ async function main(): Promise<number> {
       return cmdResume(f, pos);
     case 'approve':
       return cmdResume(f, pos, true);
+    case 'reject':
+      return cmdReject(f, pos);
     case 'status':
     case 'list':
       await cmdStatus(f, pos);

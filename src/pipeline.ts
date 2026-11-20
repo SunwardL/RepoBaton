@@ -3,13 +3,16 @@ import path from 'node:path';
 import { AgentRegistry } from './agents/registry.ts';
 import { detectProject } from './detect.ts';
 import * as G from './git.ts';
+import { FileEventSink, noopSink, type EventSink } from './events.ts';
 import { silentLogger, type Logger } from './log.ts';
+import { teeLogger } from './teelog.ts';
 import { DEFAULT_PROMPTS, loadPrompt, PLAN_SCHEMA, RELEASE_SCHEMA, REVIEW_SCHEMA } from './prompts.ts';
 import { runShell } from './proc.ts';
 import { formatAcceptance, formatPlan, renderReport } from './report.ts';
 import { newRunId, RunStore } from './store.ts';
 import {
   AgentError,
+  type AgentErrorKind,
   type AgentResult,
   type AgentRunRequest,
   type Config,
@@ -25,6 +28,9 @@ import { ensureDir, nowIso, sleep, slugify, tail, truncate, validateSchema, read
 
 export class PipelineError extends Error {
   status: RunState['status'];
+  /** Set when an agent failure ended the run, so the UI can say what to fix. */
+  kind?: AgentErrorKind;
+  agent?: string;
   constructor(message: string, status: RunState['status'] = 'failed') {
     super(message);
     this.name = 'PipelineError';
@@ -56,6 +62,8 @@ export class Pipeline {
   readonly store: RunStore;
   private cfg: Config;
   private log: Logger;
+  private baseLog: Logger;
+  private events: EventSink = noopSink;
   private repo: string;
   private registry: AgentRegistry;
   private signal?: AbortSignal;
@@ -67,7 +75,8 @@ export class Pipeline {
     this.cfg = opts.publishOverride
       ? { ...opts.config, publish: { ...opts.config.publish, ...opts.publishOverride } }
       : opts.config;
-    this.log = opts.log ?? silentLogger;
+    this.baseLog = opts.log ?? silentLogger;
+    this.log = this.baseLog;
     this.signal = opts.signal;
     this.registry = opts.registry ?? new AgentRegistry(this.cfg);
     this.store = new RunStore(this.repo);
@@ -94,6 +103,8 @@ export class Pipeline {
       usage: { costUsd: 0, inputTokens: 0, outputTokens: 0, calls: 0 },
     };
     await this.store.save(state);
+    await this.openEvents(state);
+    this.events.emit('run.started', task.slice(0, 120).replace(/\s+/g, ' '), { data: { task } });
     this.log.info(`run ${id}`);
     return this.execute(state);
   }
@@ -105,17 +116,41 @@ export class Pipeline {
       this.log.info('run already succeeded; nothing to do');
       return state;
     }
-    if (state.status === 'awaiting-plan-approval' && !ropts.approvePlan && !this.opts.approvePlan) {
+    if (state.status === 'awaiting-plan-approval' && !ropts.approvePlan && !ropts.feedback && !this.opts.approvePlan) {
       throw new PipelineError('this run is waiting for plan approval: use "repobaton approve <run>"', 'awaiting-plan-approval');
     }
     if (ropts.approvePlan) state.planApproved = true;
     if (ropts.moreRounds) state.extraRounds = (state.extraRounds ?? 0) + ropts.moreRounds;
-    if (ropts.feedback) state.pendingFeedback = ropts.feedback;
+    if (ropts.feedback) {
+      // Feedback given while the plan is still unapproved is about the plan.
+      if (state.status === 'awaiting-plan-approval' && !ropts.approvePlan) state.planFeedback = ropts.feedback;
+      else state.pendingFeedback = ropts.feedback;
+    }
     state.status = 'running';
     state.error = undefined;
     await this.store.save(state);
+    await this.openEvents(state);
+    this.events.emit('run.resumed', `resuming from ${state.stage ?? 'the start'}`, {
+      data: { moreRounds: ropts.moreRounds, approvePlan: !!ropts.approvePlan, hasFeedback: !!ropts.feedback },
+    });
     this.log.info(`resuming run ${state.id}`);
     return this.execute(state);
+  }
+
+  /** Each run owns <run>/events.jsonl; logs are mirrored into it. */
+  private async openEvents(state: RunState): Promise<void> {
+    this.events = await FileEventSink.open(this.store.dir(state.id), state.id);
+    this.log = teeLogger(this.baseLog, this.events);
+  }
+
+  /** Reject the pending plan with feedback; the planner revises it and the run pauses again. */
+  async rejectPlan(idOrPrefix: string, feedback: string): Promise<RunState> {
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    if (state.status !== 'awaiting-plan-approval' || !state.plan) {
+      throw new PipelineError('this run has no pending plan to reject');
+    }
+    return this.resume(id, { feedback: feedback.trim() || 'Please revise the plan.' });
   }
 
   // ------------------------------------------------------------------ main flow
@@ -123,10 +158,11 @@ export class Pipeline {
   private async execute(state: RunState): Promise<RunState> {
     try {
       await this.prepare(state);
-      if (this.cfg.stages.plan.enabled !== false && !state.plan) {
+      if (this.cfg.stages.plan.enabled !== false && (!state.plan || state.planFeedback)) {
         await this.planStage(state);
         if (state.status === 'awaiting-plan-approval') return await this.finish(state);
       } else if (this.needsApproval(state)) {
+        // Resumed without an approval decision: stay paused rather than guess.
         if (!(await this.confirmPlan(state))) return await this.finish(state);
       }
       const approved = await this.implementLoop(state);
@@ -144,6 +180,8 @@ export class Pipeline {
       } else if (e instanceof PipelineError) {
         state.status = e.status;
         state.error = e.message;
+        state.errorKind = e.kind;
+        state.errorAgent = e.agent;
       } else {
         state.status = 'failed';
         state.error = (e as Error).message;
@@ -156,6 +194,10 @@ export class Pipeline {
   private async finish(state: RunState): Promise<RunState> {
     state.stage = undefined;
     await this.store.save(state);
+    this.events.emit('run.finished', state.error ?? state.status, {
+      data: { status: state.status, rounds: state.rounds.length, usage: state.usage },
+    });
+    await this.events.flush();
     await fs.writeFile(path.join(this.store.dir(state.id), 'report.md'), renderReport(state), 'utf8');
     return state;
   }
@@ -163,6 +205,7 @@ export class Pipeline {
   private checkpoint(state: RunState, stage: string): Promise<void> {
     if (this.signal?.aborted) throw new AgentError('cancelled', false);
     state.stage = stage;
+    this.events.emit('stage.started', stage, { stage });
     return this.store.save(state);
   }
 
@@ -222,6 +265,10 @@ export class Pipeline {
       for (let n = 1; n <= attempts; n++) {
         if (this.signal?.aborted) throw new AgentError('cancelled', false);
         this.log.stage(stage, `${label} → ${agentId} [${agent.describe()}]${n > 1 ? ` (attempt ${n})` : ''}`);
+        this.events.emit('agent.started', `${label} → ${agentId}`, {
+          stage,
+          data: { label, agent: agentId, attempt: n, access: req.access },
+        });
         try {
           const res = await agent.run({
             ...req,
@@ -233,7 +280,10 @@ export class Pipeline {
             timeoutMs: (sc.timeoutSec ?? 900) * 1000,
             signal: this.signal,
             sessionId: idx === 0 ? req.sessionId : undefined,
-            onProgress: (l) => this.log.detail(l),
+            onProgress: (l) => {
+              this.log.detail(l);
+              this.events.emit('agent.progress', l.slice(0, 300), { stage, data: { label, agent: agentId } });
+            },
           });
           if (req.schema) {
             const errs = validateSchema(req.schema, res.structured);
@@ -255,23 +305,45 @@ export class Pipeline {
           if (this.signal?.aborted || lastErr.message === 'cancelled') throw new AgentError('cancelled', false);
           const retryable = !(e instanceof AgentError) || e.retryable;
           this.log.warn(`${stage}/${agentId} failed: ${lastErr.message}`);
+          this.events.emit('agent.failed', lastErr.message.slice(0, 500), {
+            stage,
+            data: {
+              label,
+              agent: agentId,
+              attempt: n,
+              retryable,
+              kind: e instanceof AgentError ? e.kind : 'unknown',
+            },
+          });
           if (!retryable) break;
           if (n < attempts) await sleep(2000 * n);
         }
       }
     }
-    throw new PipelineError(`${stage} stage failed: ${lastErr.message}`);
+    const pe = new PipelineError(`${stage} stage failed: ${lastErr.message}`);
+    pe.kind = lastErr instanceof AgentError ? lastErr.kind : 'unknown';
+    pe.agent = chain[chain.length - 1];
+    throw pe;
   }
 
   // ------------------------------------------------------------------ plan
 
   private async planStage(state: RunState): Promise<void> {
     await this.checkpoint(state, 'plan');
-    let feedback = '';
     for (let attempt = 0; attempt < 4; attempt++) {
-      const prompt = await loadPrompt('plan', this.repo, this.cfg.stages.plan.promptFile, { task: state.task });
+      // planFeedback is consumed here and only here: it is about the plan, never the code.
+      const feedback = state.planFeedback;
+      const previous = state.plan;
+      state.planFeedback = undefined;
+      const base = await loadPrompt('plan', this.repo, this.cfg.stages.plan.promptFile, { task: state.task });
+      const prompt = feedback
+        ? `${base}\n\n# Reviewer feedback on your previous plan\n` +
+          (previous ? `Previous plan:\n${formatPlan(previous)}\n\n` : '') +
+          `${feedback}\nRevise the plan accordingly.`
+        : base;
+      state.planApproved = false;
       const res = await this.invoke(state, 'plan', `plan${attempt ? `-${attempt + 1}` : ''}`, {
-        prompt: feedback ? `${prompt}\n\n# Reviewer feedback on your previous plan\n${feedback}\nRevise the plan accordingly.` : prompt,
+        prompt,
         access: 'read-only',
         schema: PLAN_SCHEMA,
       });
@@ -283,10 +355,8 @@ export class Pipeline {
       this.log.stage('plan', `${state.plan.steps.length} steps, ${state.plan.acceptance.length} acceptance criteria`);
       if (!this.needsApproval(state)) return;
       const decision = await this.confirmPlanDecision(state);
-      if (decision === 'paused') return;
-      if (decision === 'approved') return;
-      feedback = decision;
-      state.plan = undefined;
+      if (decision === 'paused' || decision === 'approved') return;
+      state.planFeedback = decision;
     }
     throw new PipelineError('plan was rejected too many times', 'needs-human');
   }
@@ -295,19 +365,15 @@ export class Pipeline {
     return !!this.cfg.stages.plan.requireApproval && !!state.plan && !state.planApproved;
   }
 
+  /** Called when a run resumes with an unapproved plan and no decision: stay paused. */
   private async confirmPlan(state: RunState): Promise<boolean> {
     const d = await this.confirmPlanDecision(state);
     if (d === 'approved') return true;
     if (d === 'paused') return false;
-    // Rejected on resume: replan with feedback.
-    state.plan = undefined;
-    await this.planStageWithFeedback(state, d);
-    return state.status !== 'awaiting-plan-approval';
-  }
-
-  private async planStageWithFeedback(state: RunState, feedback: string): Promise<void> {
-    state.pendingFeedback = feedback;
+    // Interactive rejection on resume: replan with the feedback.
+    state.planFeedback = d;
     await this.planStage(state);
+    return !this.needsApproval(state) || state.status !== 'awaiting-plan-approval';
   }
 
   private async confirmPlanDecision(state: RunState): Promise<'approved' | 'paused' | string> {
