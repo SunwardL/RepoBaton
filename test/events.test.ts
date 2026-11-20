@@ -237,3 +237,59 @@ test('event lines are readable and statuses that stop a run are known', () => {
   assert.ok(SETTLED_STATUSES.includes('awaiting-plan-approval'));
   assert.ok(!SETTLED_STATUSES.includes('running'));
 });
+
+import { RunStore } from '../src/store.ts';
+
+test('a settled status guarantees run.finished is already in the file', async () => {
+  const repo = await tmp('rb-race-');
+  await git(repo, ['init', '-q', '-b', 'main']);
+  await git(repo, ['config', 'user.email', 't@e.com']);
+  await git(repo, ['config', 'user.name', 't']);
+  await fs.writeFile(path.join(repo, 'a.txt'), 'x\n');
+  await git(repo, ['add', '-A']);
+  await git(repo, ['commit', '-q', '-m', 'init']);
+
+  const config = defaultConfig();
+  config.agents = { p: { type: 'command', command: 'x' } };
+  for (const s of ['plan', 'implement', 'review', 'release'] as const) config.stages[s].agent = 'p';
+  config.stages.plan.retries = 0;
+  config.test.setup = '';
+  const failing = new Scripted('p', () => {
+    throw new AgentError('boom', false, 'unknown');
+  });
+  const registry = { get: () => failing } as unknown as AgentRegistry;
+  const pipe = new Pipeline({ repo, config, registry });
+  const store = new RunStore(repo);
+
+  // Make appends slow, so any ordering bug shows up on every run rather than once in a while.
+  const realAppend = fs.appendFile.bind(fs);
+  let slow = true;
+  (fs as { appendFile: typeof fs.appendFile }).appendFile = (async (...args: Parameters<typeof fs.appendFile>) => {
+    if (slow) await new Promise((r) => setTimeout(r, 40));
+    return realAppend(...args);
+  }) as typeof fs.appendFile;
+
+  const violations: string[] = [];
+  let watching = true;
+  const watcher = (async () => {
+    while (watching) {
+      for (const run of await store.list()) {
+        if (!['succeeded', 'failed', 'cancelled', 'needs-human', 'awaiting-plan-approval'].includes(run.status)) continue;
+        const events = await readEvents(eventsFile(store.dir(run.id)));
+        if (!events.some((e) => e.type === 'run.finished')) violations.push(`${run.status} visible without run.finished`);
+      }
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  })();
+
+  try {
+    const state = await pipe.start('do a thing');
+    assert.equal(state.status, 'failed');
+  } finally {
+    slow = false;
+    watching = false;
+    await watcher;
+    (fs as { appendFile: typeof fs.appendFile }).appendFile = realAppend as typeof fs.appendFile;
+  }
+  assert.deepEqual(violations, []);
+});

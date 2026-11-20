@@ -193,11 +193,13 @@ export class Pipeline {
 
   private async finish(state: RunState): Promise<RunState> {
     state.stage = undefined;
-    await this.store.save(state);
+    // Order matters: readers treat a settled status in state.json as "no more events
+    // are coming", so the closing event must be on disk before that status is.
     this.events.emit('run.finished', state.error ?? state.status, {
       data: { status: state.status, rounds: state.rounds.length, usage: state.usage },
     });
     await this.events.flush();
+    await this.store.save(state);
     await fs.writeFile(path.join(this.store.dir(state.id), 'report.md'), renderReport(state), 'utf8');
     return state;
   }
