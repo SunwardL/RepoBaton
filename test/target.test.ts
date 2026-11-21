@@ -186,6 +186,8 @@ test('a tag step records and checks the tag push address as well', async () => {
   await git(f.repo, ['remote', 'set-url', '--push', 'origin', f.pushRepo]);
   // The tag points at the merge commit; here the base commit stands in for it.
   const merge = (await git(f.repo, ['rev-parse', 'main'])).trim();
+  // The merge commit has to be on the base branch of the repository the tag is written to.
+  await git(f.repo, ['push', '-q', f.pushRepo, 'main:refs/heads/main']);
   const st = await f.store.load('run1');
   st.publish.mergeSha = merge;
   await f.store.save(st);
@@ -234,7 +236,7 @@ class GhDouble implements RemoteOps {
   head = '';
   push = realRemoteOps.push;
   pushTag = realRemoteOps.pushTag;
-  fetchRemote = async (): Promise<void> => {};
+  fetchMergeCommit = realRemoteOps.fetchMergeCommit;
   pushUrls = realRemoteOps.pushUrls;
   remoteBranchSha = realRemoteOps.remoteBranchSha;
   remoteTagTarget = realRemoteOps.remoteTagTarget;
@@ -357,4 +359,80 @@ test('GitHub repository identification accepts the usual forms and nothing else'
   assert.equal(githubRepoOfPr('https://github.com/Owner/Repo/pull/12'), 'github.com/owner/repo');
   assert.equal(githubRepoOfPr('https://github.com/owner/repo/issues/12'), null);
   assert.equal(sanitizeRemoteUrl('https://user:tok@github.com/o/r.git?x=1'), 'https://github.com/o/r.git');
+});
+
+// ------------------------------------------------------------------ tag: the merge commit comes from the write repository
+
+/**
+ * A commit that exists only where it is pushed: the stand-in for a PR merge commit. It is built in
+ * a scratch clone so the repository under test never holds it locally and has to fetch it.
+ */
+async function mergeCommitOn(f: Fixture, where: string[]): Promise<string> {
+  const scratch = path.join(f.tmp, 'scratch-' + Math.random().toString(36).slice(2, 8));
+  await git(f.tmp, ['clone', '-q', f.repo, scratch]);
+  await git(scratch, ['config', 'user.email', 't@e.com']);
+  await git(scratch, ['config', 'user.name', 't']);
+  await fs.writeFile(path.join(scratch, 'merged.txt'), 'merged\n');
+  await git(scratch, ['add', 'merged.txt']);
+  await git(scratch, ['commit', '-q', '-m', 'merge commit']);
+  const sha = (await git(scratch, ['rev-parse', 'HEAD'])).trim();
+  for (const w of where) await git(scratch, ['push', '-q', w, 'HEAD:refs/heads/main']);
+  return sha;
+}
+
+async function tagFixture(): Promise<Fixture> {
+  const f = await fixture({ push: false, createPr: false, merge: false, tag: true }, { pushed: true, merged: true });
+  await git(f.repo, ['remote', 'set-url', '--push', 'origin', f.pushRepo]);
+  return f;
+}
+
+test('tag: a merge commit that exists only in the write repository is fetched from there and tagged, and only there', async () => {
+  const f = await tagFixture();
+  const merge = await mergeCommitOn(f, [f.pushRepo]);
+  assert.equal(await refs(f.fetchRepo), '', 'the read repository has nothing');
+  await assert.rejects(git(f.repo, ['cat-file', '-e', merge + '^{commit}']), 'the commit is not local before the tag step');
+  const st = await f.store.load('run1');
+  st.publish.mergeSha = merge;
+  await f.store.save(st);
+  const out = await new Pipeline({ repo: f.repo, config: f.config, registry, remote: realRemoteOps }).resume('run1');
+  assert.equal(out.status, 'succeeded', out.error);
+  assert.equal((await git(f.pushRepo, ['rev-parse', 'refs/tags/v1.0.1^{commit}'])).trim(), merge, 'the tag points at the merge commit');
+  assert.match(await refs(f.pushRepo), /refs\/tags\/v1\.0\.1/);
+  assert.equal(await refs(f.fetchRepo), '', 'the tag never reached the read repository');
+  assert.equal(await refs(f.otherRepo), '');
+  const after = await f.store.load('run1');
+  assert.equal(after.publish.tagPushed, true);
+  assert.equal(after.publish.inFlight, undefined);
+});
+
+test('tag: a merge commit that only the read repository has is refused, and nothing is tagged anywhere', async () => {
+  const f = await tagFixture();
+  const merge = await mergeCommitOn(f, [f.fetchRepo]);
+  const st = await f.store.load('run1');
+  st.publish.mergeSha = merge;
+  await f.store.save(st);
+  const out = await new Pipeline({ repo: f.repo, config: f.config, registry, remote: realRemoteOps }).resume('run1');
+  assert.equal(out.status, 'needs-human');
+  assert.match(out.error ?? '', /refusing to tag/);
+  const after = await f.store.load('run1');
+  assert.equal(after.publish.inFlight, undefined, 'nothing was started');
+  assert.equal(after.publish.tagPushed, undefined);
+  assert.equal((await git(f.repo, ['tag', '--list'])).trim(), '', 'no local tag was created');
+  assert.equal(await refs(f.pushRepo), '');
+  assert.doesNotMatch(await refs(f.fetchRepo), /refs\/tags\//);
+});
+
+test('tag: a write repository whose base branch does not contain the merge commit is refused', async () => {
+  const f = await tagFixture();
+  const merge = await mergeCommitOn(f, [f.otherRepo]);
+  await git(f.repo, ['push', '-q', f.pushRepo, 'main:refs/heads/main']); // the write side has a main, but not that commit
+  const st = await f.store.load('run1');
+  st.publish.mergeSha = merge;
+  await f.store.save(st);
+  const out = await new Pipeline({ repo: f.repo, config: f.config, registry, remote: realRemoteOps }).resume('run1');
+  assert.equal(out.status, 'needs-human');
+  assert.match(out.error ?? '', /refusing to tag/);
+  assert.equal((await f.store.load('run1')).publish.inFlight, undefined);
+  assert.equal((await git(f.repo, ['tag', '--list'])).trim(), '');
+  assert.doesNotMatch(await refs(f.pushRepo), /refs\/tags\//);
 });

@@ -802,11 +802,16 @@ export class Pipeline {
     const tag = `${p.tagPrefix}${rel.suggested_version}`;
     const root = this.repo;
     if ((await G.tagExists(root, tag)) && state.publish.pendingTag !== tag) throw new PipelineError(`tag ${tag} already exists`, 'needs-human');
-    // Tag the commit that actually landed on the base branch.
-    await this.ops.fetchRemote(root, p.remote);
     const sha = state.publish.mergeSha;
     if (!sha) throw new PipelineError('cannot tag: merge commit is unknown', 'needs-human');
+    // The merge commit lives where the PR was merged: the repository this run writes to, which can
+    // differ from the read address. Fetch it from there and confirm it is on that repository's base
+    // branch before anything is tagged.
     const target = await this.writeTarget(false);
+    const [address] = await this.ops.pushUrls(root, p.remote);
+    if (!(await this.ops.fetchMergeCommit(root, address, state.base!.branch, sha))) {
+      throw new PipelineError(`merge commit ${sha.slice(0, 8)} is not on ${state.base!.branch} at ${target.url}, the repository this run writes to; refusing to tag it`, 'needs-human');
+    }
     state.publish.pendingTag = tag;
     await this.markInFlight(state, 'tag', target);
     // A tag that already exists locally at the merge commit (an earlier attempt got that far) is reused.

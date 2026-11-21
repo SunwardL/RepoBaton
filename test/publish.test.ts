@@ -48,8 +48,11 @@ class FakeRemote implements RemoteOps {
   async pushTag(): Promise<void> {
     this.count('pushTag');
   }
-  async fetchRemote(): Promise<void> {
+  /** Whether the merge commit counts as being on the base branch of the push address. */
+  mergeOnBase = true;
+  async fetchMergeCommit(): Promise<boolean> {
     this.count('fetch');
+    return this.mergeOnBase;
   }
   async ghAvailable(): Promise<boolean> {
     return true;

@@ -282,8 +282,23 @@ export async function ghMergeCommit(cwd: string, pr: string, repo: string): Prom
   return r.code === 0 ? r.stdout.trim() : '';
 }
 
-export async function fetchRemote(cwd: string, remote: string): Promise<void> {
-  await git(cwd, ['fetch', remote, '--tags'], { timeoutMs: 300_000 });
+/**
+ * Fetch the base branch from the address a push writes to (not the read address, which can be a
+ * different repository) and report whether `sha` is now a local commit reachable from that
+ * branch. Only a merge commit confirmed this way is safe to tag.
+ */
+export async function fetchMergeCommit(cwd: string, address: string, branch: string, sha: string): Promise<boolean> {
+  // A write repository with no such branch cannot contain the commit. Ask first, so that only a
+  // branch that is really absent counts as "not on it"; a failed lookup still throws.
+  const listed = await git(cwd, ['ls-remote', '--heads', address, `refs/heads/${branch}`], { timeoutMs: 60_000 });
+  if (!listed.trim()) return false;
+  await git(cwd, ['fetch', '--no-tags', address, `refs/heads/${branch}`], { timeoutMs: 300_000 });
+  const tip = (await git(cwd, ['rev-parse', '--verify', '--quiet', 'FETCH_HEAD^{commit}'], { allowFail: true })).trim();
+  if (!tip) return false;
+  const have = (await git(cwd, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], { allowFail: true })).trim();
+  if (!have || have !== sha.toLowerCase()) return false;
+  const common = (await git(cwd, ['merge-base', have, tip], { allowFail: true })).trim();
+  return common === have;
 }
 
 export interface PrInfo {
@@ -337,7 +352,8 @@ export async function ghPrView(cwd: string, ref: string, repo: string): Promise<
 export interface RemoteOps {
   push(cwd: string, remote: string, branch: string): Promise<void>;
   pushTag(cwd: string, remote: string, tag: string): Promise<void>;
-  fetchRemote(cwd: string, remote: string): Promise<void>;
+  /** Fetch the base branch from the push address and confirm `sha` is a commit on it. */
+  fetchMergeCommit(cwd: string, address: string, branch: string, sha: string): Promise<boolean>;
   ghAvailable(cwd: string): Promise<boolean>;
   ghCreatePr(cwd: string, o: { repo: string; base: string; head: string; title: string; body: string; draft: boolean }): Promise<string>;
   ghMarkReady(cwd: string, pr: string, repo: string): Promise<void>;
@@ -351,5 +367,5 @@ export interface RemoteOps {
 }
 
 export const realRemoteOps: RemoteOps = {
-  push, pushTag, fetchRemote, ghAvailable, ghCreatePr, ghMarkReady, ghMergePr, ghMergeCommit, pushUrls, remoteBranchSha, remoteTagTarget, ghPrView,
+  push, pushTag, fetchMergeCommit, ghAvailable, ghCreatePr, ghMarkReady, ghMergePr, ghMergeCommit, pushUrls, remoteBranchSha, remoteTagTarget, ghPrView,
 };
