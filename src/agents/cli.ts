@@ -104,6 +104,7 @@ export class ClaudeCliAgent extends CliAgent {
     if (this.cfg.maxBudgetUsd) args.push('--max-budget-usd', String(this.cfg.maxBudgetUsd));
     args.push(...(this.cfg.extraArgs ?? []));
 
+    req.onLaunch?.(this.cliInfo(d));
     const { launch, shell } = toLaunchWithShell(d.launch);
     const r = await runLaunch(launch, args, {
       cwd: req.cwd,
@@ -196,6 +197,7 @@ export class CodexCliAgent extends CliAgent {
       if (req.sessionId) args.push(req.sessionId);
       args.push('-'); // prompt from stdin: avoids argv length limits on Windows
 
+      req.onLaunch?.(this.cliInfo(d));
       const { launch, shell } = toLaunchWithShell(d.launch);
       const events: any[] = [];
       let threadId: string | undefined = req.sessionId;

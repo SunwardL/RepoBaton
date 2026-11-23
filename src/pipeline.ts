@@ -329,6 +329,12 @@ export class Pipeline {
             timeoutMs: (sc.timeoutSec ?? 900) * 1000,
             signal: this.signal,
             sessionId: agentId === sessionAgent ? req.sessionId : undefined,
+            onLaunch: (cli) => {
+              session.cli = cli;
+              // Queued, not awaited: the call must not wait for the disk. Writes to this run's file are
+              // ordered by the store, so this snapshot can never land after a later one.
+              void this.store.save(state).catch(() => undefined);
+            },
             onSession: (id, confirmed = true) => {
               if (session.sessionId === id) return;
               session.sessionId = id;

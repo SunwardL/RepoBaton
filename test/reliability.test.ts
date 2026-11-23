@@ -3,10 +3,10 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import type { AgentRegistry } from '../src/agents/registry.ts';
 import { ClaudeCliAgent, CodexCliAgent } from '../src/agents/cli.ts';
 import { defaultConfig } from '../src/config.ts';
 import { git } from '../src/git.ts';
+import { AgentRegistry } from '../src/agents/registry.ts';
 import { Pipeline } from '../src/pipeline.ts';
 import { recoverInterrupted } from '../src/recovery.ts';
 import { RunStore } from '../src/store.ts';
@@ -297,4 +297,230 @@ test('the pipeline records how the CLI that created each session was launched', 
   assert.equal(path.resolve(res.cli!.path).toLowerCase(), path.resolve(script).toLowerCase());
   const cmd = resumeCommand({ agentType: 'codex-cli', sessionId: SID, cwd: dir, cli: res.cli });
   assert.ok(cmd?.includes(' resume ' + SID));
+});
+
+// ------------------------------------------------------------------ follow-up A: state writes are ordered
+
+/**
+ * Slow down the write of exactly the snapshots that satisfy `when`, by delaying the rename that
+ * publishes them. Returns a function that puts the real rename back.
+ */
+function delaySnapshots(when: (s: RunState) => boolean, ms: number): () => void {
+  const target = fs as unknown as { rename: (a: string, b: string) => Promise<void> };
+  const real = target.rename.bind(fs);
+  target.rename = async (from: string, to: string): Promise<void> => {
+    if (to.endsWith('state.json')) {
+      try {
+        if (when(JSON.parse(await fs.readFile(from, 'utf8')) as RunState)) await new Promise((r) => setTimeout(r, ms));
+      } catch {
+        /* not a snapshot we recognise: do not delay */
+      }
+    }
+    return real(from, to);
+  };
+  return () => {
+    target.rename = real;
+  };
+}
+
+function minimalState(repo: string, over: Partial<RunState> = {}): RunState {
+  const now = new Date().toISOString();
+  return { id: 'ord', task: 't', repo, status: 'running', createdAt: now, updatedAt: now, rounds: [], publish: {}, usage: { costUsd: 0, inputTokens: 0, outputTokens: 0, calls: 0 }, ...over };
+}
+
+test('state writes for one run land in the order they were requested, even when an earlier one is slow', async () => {
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-ord-'));
+  const store = new RunStore(repo);
+  const state = minimalState(repo);
+  const restore = delaySnapshots((s) => s.status === 'running', 250);
+  try {
+    const first = store.save(state); // snapshot: running (slow)
+    state.status = 'failed';
+    const second = store.save(state); // snapshot: failed (fast)
+    await Promise.all([first, second]);
+  } finally {
+    restore();
+  }
+  assert.equal((await store.load('ord')).status, 'failed', 'the newest requested state is the one on disk');
+});
+
+test('two stores over the same repository share one write order', async () => {
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-ord-'));
+  const a = new RunStore(repo);
+  const b = new RunStore(repo);
+  const state = minimalState(repo);
+  const restore = delaySnapshots((s) => s.status === 'running', 250);
+  try {
+    const first = a.save(state);
+    state.status = 'interrupted';
+    const second = b.save(state);
+    await Promise.all([first, second]);
+  } finally {
+    restore();
+  }
+  assert.equal((await a.load('ord')).status, 'interrupted');
+});
+
+test('a failed write does not block the writes queued behind it', async () => {
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-ord-'));
+  const store = new RunStore(repo);
+  const state = minimalState(repo);
+  const target = fs as unknown as { rename: (a: string, b: string) => Promise<void> };
+  const real = target.rename.bind(fs);
+  let failedOnce = false;
+  target.rename = async (from: string, to: string): Promise<void> => {
+    if (!failedOnce && to.endsWith('state.json')) {
+      failedOnce = true;
+      throw Object.assign(new Error('disk said no'), { code: 'ENOSPC' });
+    }
+    return real(from, to);
+  };
+  try {
+    const first = store.save(state).then(() => 'ok', () => 'failed');
+    state.status = 'failed';
+    const second = store.save(state);
+    assert.equal(await first, 'failed');
+    await second;
+  } finally {
+    target.rename = real;
+  }
+  assert.equal((await store.load('ord')).status, 'failed');
+});
+
+/** Reports a session id and returns at once, so the save started by onSession is still in flight when the stage ends. */
+class QuickNative implements Agent {
+  type = 'codex-cli' as const;
+  id = 'quick';
+  describe(): string {
+    return 'quick';
+  }
+  async check(): Promise<{ ok: boolean; detail: string }> {
+    return { ok: true, detail: '' };
+  }
+  async run(req: AgentRunRequest): Promise<AgentResult> {
+    req.onSession?.('sess-early');
+    return { text: 'done', durationMs: 1, sessionId: 'sess-early' };
+  }
+}
+
+test('pipeline: a slow save started when the session id arrived cannot overwrite the finished stage', async () => {
+  const quick = new QuickNative();
+  const { pipe, repo } = await repoWith({ boom: quick });
+  const restore = delaySnapshots((s) => !!s.sessions?.some((x) => x.sessionId === 'sess-early' && x.status === 'running'), 300);
+  try {
+    await pipe.start('t').catch(() => null);
+    await new Promise((r) => setTimeout(r, 600)); // long enough for a stray late write to land
+  } finally {
+    restore();
+  }
+  const stored = await new RunStore(repo).load(await new RunStore(repo).resolve('last'));
+  const s = stored.sessions?.find((x) => x.stage === 'implement');
+  assert.equal(s?.sessionId, 'sess-early');
+  assert.equal(s?.status, 'completed', 'the stage finished; an older "running" snapshot must not be the last write');
+  assert.ok(s?.finishedAt);
+});
+
+// ------------------------------------------------------------------ follow-up B: the launch is recorded before the call
+
+const SID2 = '0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0';
+
+/** A native Codex pipeline whose CLI is a fake script in a directory with a space in its name. */
+async function nativePipe(script: string, timeoutSec: number, signal?: AbortSignal): Promise<{ pipe: Pipeline; repo: string }> {
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-launch-'));
+  await git(repo, ['init', '-q', '-b', 'main']);
+  await git(repo, ['config', 'user.email', 't@e.com']);
+  await git(repo, ['config', 'user.name', 't']);
+  await fs.writeFile(path.join(repo, 'value.txt'), 'old\n');
+  await git(repo, ['add', '-A']);
+  await git(repo, ['commit', '-q', '-m', 'init']);
+  const config = defaultConfig();
+  config.agents = { n: { type: 'codex-cli', path: script } };
+  config.stages.plan.enabled = false;
+  config.stages.implement.agent = 'n';
+  config.stages.implement.retries = 0;
+  config.stages.implement.timeoutSec = timeoutSec;
+  config.stages.review.agent = 'n';
+  config.stages.release.agent = 'n';
+  config.test.setup = '';
+  return { pipe: new Pipeline({ repo, config, registry: new AgentRegistry(config), signal }), repo };
+}
+
+async function spacedDir(): Promise<string> {
+  return fs.mkdtemp(path.join(os.tmpdir(), 'rb fake cli-'));
+}
+
+const threadStarted = 'console.log(JSON.stringify({ type: "thread.started", thread_id: "' + SID2 + '" }));\n';
+
+async function implementSession(repo: string): Promise<NonNullable<RunState['sessions']>[number]> {
+  const store = new RunStore(repo);
+  const s = (await store.load(await store.resolve('last'))).sessions?.find((x) => x.stage === 'implement');
+  assert.ok(s, 'the implement call left a session record');
+  return s;
+}
+
+test('a call that fails after the CLI announced its session keeps the CLI launch, so the command is runnable', async () => {
+  const script = await fakeCli(await spacedDir(), 'codex', threadStarted + 'process.exit(1);\n');
+  const { pipe, repo } = await nativePipe(script, 30);
+  await pipe.start('t').catch(() => null);
+  const s = await implementSession(repo);
+  assert.equal(s.status, 'failed');
+  assert.equal(s.sessionId, SID2);
+  assert.ok(s.cli?.path, 'the executable that was launched is recorded even though the call failed');
+  const cmd = resumeCommand(s);
+  assert.ok(cmd, 'a command is offered');
+  assert.ok(cmd.includes('rb fake cli-'), 'it uses the real location, not the bare name: ' + cmd);
+  assert.ok(!/ && codex resume /.test(cmd), 'and does not fall back to a bare "codex"');
+});
+
+test('a call that times out keeps the CLI launch', async () => {
+  const script = await fakeCli(await spacedDir(), 'codex', threadStarted + 'setTimeout(() => {}, 60000);\n');
+  const { pipe, repo } = await nativePipe(script, 1);
+  await pipe.start('t').catch(() => null);
+  const s = await implementSession(repo);
+  assert.equal(s.status, 'failed');
+  assert.equal(s.sessionId, SID2);
+  assert.ok(s.cli?.path);
+  assert.ok(resumeCommand(s)?.includes('rb fake cli-'));
+});
+
+test('while the call is still running, the saved record already carries the id and the CLI launch', async () => {
+  const script = await fakeCli(await spacedDir(), 'codex', threadStarted + 'setTimeout(() => {}, 60000);\n');
+  const ctl = new AbortController();
+  const { pipe, repo } = await nativePipe(script, 120, ctl.signal);
+  const done = pipe.start('t').catch(() => null);
+  const store = new RunStore(repo);
+  let onDisk: NonNullable<RunState['sessions']>[number] | undefined;
+  const end = Date.now() + 20000;
+  while (Date.now() < end && !onDisk) {
+    await new Promise((r) => setTimeout(r, 100));
+    const ids = await store.list();
+    onDisk = ids[0]?.sessions?.find((x) => x.stage === 'implement' && x.sessionId && x.cli);
+  }
+  ctl.abort();
+  await done;
+  assert.ok(onDisk, 'the id and the launch reached disk during the call (what a server stop would leave behind)');
+  assert.equal(onDisk.status, 'running');
+  assert.ok(resumeCommand(onDisk)?.includes('rb fake cli-'));
+});
+
+test('recovery keeps the recorded launch when it closes a running session', async () => {
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-rel-'));
+  const store = new RunStore(repo);
+  const now = new Date().toISOString();
+  const wt = path.join(repo, 'wt');
+  await store.save(
+    minimalState(repo, {
+      id: 'rec',
+      stage: 'implement-r1',
+      owner: { serverId: 'old', pid: 424242, startedAt: now },
+      sessions: [
+        { label: 'implement-r1', stage: 'implement', agent: 'n', agentType: 'codex-cli', sessionId: SID2, persisted: true, cwd: wt, status: 'running', startedAt: now, cli: { path: 'D:\\tools\\codex.exe' } },
+      ],
+    }),
+  );
+  await recoverInterrupted(store, { currentServerId: 'new', isExecuting: () => false, probe: async () => ({ alive: false }) });
+  const s = (await store.load('rec')).sessions![0];
+  assert.equal(s.status, 'interrupted');
+  assert.equal(s.cli?.path, 'D:\\tools\\codex.exe');
+  assert.ok(resumeCommand(s)?.includes('D:\\tools\\codex.exe'));
 });

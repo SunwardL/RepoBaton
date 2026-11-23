@@ -117,6 +117,11 @@ export interface AgentRunRequest {
    * survives a failure, cancellation, timeout or a server stop in the middle of the call.
    */
   onSession?: (sessionId: string, confirmed?: boolean) => void;
+  /**
+   * Called once the executable that will run is known, before the call starts, so a continue command
+   * can use the same one even if the call then fails, times out or the server stops.
+   */
+  onLaunch?: (cli: { path: string; command?: string; prefixArgs?: string[] }) => void;
 }
 
 export interface AgentResult {

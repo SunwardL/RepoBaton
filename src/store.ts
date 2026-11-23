@@ -13,6 +13,27 @@ export function newRunId(): string {
   return `${stamp}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+/**
+ * One write queue per state file, shared by every RunStore in the process. Atomic rename makes a
+ * single write complete, but says nothing about the order of two writes that overlap: an older
+ * snapshot that is slow to publish could land after a newer one and move the run backwards. Writes
+ * to the same file therefore run one after another, in the order they were requested.
+ */
+const writeQueues = new Map<string, Promise<void>>();
+
+function enqueueWrite(file: string, write: () => Promise<void>): Promise<void> {
+  const key = path.resolve(file).toLowerCase();
+  const previous = writeQueues.get(key) ?? Promise.resolve();
+  // A failed write must not stop the ones behind it; its own caller still sees the failure.
+  const run = previous.catch(() => undefined).then(write);
+  const tail = run.catch(() => undefined);
+  writeQueues.set(key, tail);
+  void tail.then(() => {
+    if (writeQueues.get(key) === tail) writeQueues.delete(key);
+  });
+  return run;
+}
+
 export class RunStore {
   readonly root: string;
   constructor(repo: string) {
@@ -23,7 +44,10 @@ export class RunStore {
   }
   async save(state: RunState): Promise<void> {
     state.updatedAt = nowIso();
-    await writeJson(path.join(this.dir(state.id), 'state.json'), redactDeep(state, { assignments: true }));
+    // The snapshot is taken now, at the moment of the request, not when its turn in the queue comes.
+    const snapshot = redactDeep(state, { assignments: true });
+    const file = path.join(this.dir(state.id), 'state.json');
+    await enqueueWrite(file, () => writeJson(file, snapshot));
   }
   async load(id: string): Promise<RunState> {
     const file = path.join(this.dir(id), 'state.json');
