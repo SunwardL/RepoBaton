@@ -95,6 +95,7 @@ const STEP_TYPES = ['agent', 'command', 'approval', 'commit'];
 const ACCESS = ['read-only', 'workspace-write'];
 const GIT_MODES = ['none', 'explicit-step', 'agent-managed'];
 const PUBLISH_FLAGS = ['push', 'createPr', 'draftPr', 'merge', 'tag'];
+const PUBLISH_TEXT = ['tagPrefix', 'remote'];
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const posInt = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v > 0;
@@ -116,7 +117,19 @@ function toRef(v: unknown): InputRef | undefined {
   return undefined;
 }
 
-function validatePublish(publish: Record<string, unknown>, mode: unknown, add: Add): void {
+function validatePublish(publish: unknown, mode: unknown, add: Add): void {
+  const field = 'git.publish';
+  if (!isRecord(publish)) {
+    add('error', 'Git 策略里的 publish 必须是对象', undefined, field);
+    return;
+  }
+  for (const [key, value] of Object.entries(publish)) {
+    if (PUBLISH_FLAGS.includes(key)) {
+      if (typeof value !== 'boolean') add('error', `publish.${key} 必须是 true 或 false`, undefined, field);
+    } else if (PUBLISH_TEXT.includes(key)) {
+      if (typeof value !== 'string' || !value.trim() || /[\s\0]/.test(value)) add('error', `publish.${key} 必须是不含空白的非空文本`, undefined, field);
+    } else add('error', `publish 里有不认识的字段 ${key}`, undefined, field);
+  }
   const on = PUBLISH_FLAGS.filter((k) => publish[k] === true);
   if (on.length && mode !== 'explicit-step') {
     add('error', 'Git 策略里的 publish 只能和 explicit-step 一起使用', undefined, 'git.publish');
@@ -147,12 +160,14 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
 
   const git = isRecord(input.git) ? input.git : undefined;
   const mode: unknown = git?.mode;
-  if (!git || typeof mode !== 'string' || !GIT_MODES.includes(mode)) {
+  if (!git) {
+    add('error', 'Git 策略必须是一个对象，例如 { mode: none }', undefined, 'git');
+  } else if (typeof mode !== 'string' || !GIT_MODES.includes(mode)) {
     add('error', 'Git 策略 mode 必须是 none 或 explicit-step', undefined, 'git.mode');
   } else if (mode === 'agent-managed') {
     add('error', 'Git 策略 agent-managed 暂未开放，请使用 none 或 explicit-step', undefined, 'git.mode');
   }
-  if (git && isRecord(git.publish)) validatePublish(git.publish, mode, add);
+  if (git && git.publish !== undefined) validatePublish(git.publish, mode, add);
 
   if (!Array.isArray(input.steps)) {
     add('error', '步骤必须是列表', undefined, 'steps');
@@ -165,6 +180,7 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
   // First pass: ids, so references can tell missing from later.
   const position = new Map<string, number>();
   const types = new Map<string, string>();
+  const envNames = new Map<string, string>();
   steps.forEach((s, index) => {
     const rawId = isRecord(s) ? s.id : undefined;
     if (!isRecord(s) || typeof rawId !== 'string' || !STEP_ID_PATTERN.test(rawId)) {
@@ -176,6 +192,11 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
       return;
     }
     position.set(rawId, index);
+    const upper = rawId.toUpperCase().replace(/-/g, '_');
+    const clash = envNames.get(upper);
+    if (clash) {
+      add('error', `步骤 id ${rawId} 与 ${clash} 会映射到同一个环境变量名 ${upper}，请改一个`, rawId, 'id');
+    } else envNames.set(upper, rawId);
     types.set(rawId, typeof s.type === 'string' ? s.type : '');
   });
 
@@ -186,6 +207,9 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
     const err = (message: string, field?: string) => add('error', message, id, field);
     const warn = (message: string, field?: string) => add('warning', message, id, field);
     if (typeof s.title !== 'string' || !s.title.trim()) err('步骤标题不能为空', 'title');
+    if (s.model !== undefined && (typeof s.model !== 'string' || /[\r\n\0]/.test(s.model) || s.model.length > 200)) {
+      err('model 必须是单行文本', 'model');
+    }
     const type = s.type;
     if (typeof type !== 'string' || !STEP_TYPES.includes(type)) {
       err(`步骤类型必须是 ${STEP_TYPES.join('、')}`, 'type');
@@ -235,6 +259,17 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
       }
     };
 
+    /** Command steps: `inputs` is the only way to hand values over, so it is checked on its own. */
+    const checkDeclared = (declared: unknown) => {
+      if (declared === undefined) return;
+      if (!Array.isArray(declared)) return err('inputs 必须是列表', 'inputs');
+      for (const d of declared) {
+        const ref = toRef(d);
+        if (ref) checkRef(ref, 'inputs');
+        else err('inputs 中有无法识别的项', 'inputs');
+      }
+    };
+
     const timeout = (v: unknown) => {
       if (v !== undefined && !posInt(v)) err('timeoutSec 必须是正整数', 'timeoutSec');
     };
@@ -265,13 +300,18 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
         const run = s.run;
         if (typeof run !== 'string' || !run.trim()) err('命令不能为空', 'run');
         else if (/[\r\n]/.test(run)) err('命令必须写成一行', 'run');
+        else if (run.includes('{{')) {
+          // Values are never spliced into a command line: an output containing & | " % or a newline
+          // would become extra commands. They are passed as environment variables instead.
+          err('命令行里不能写 {{ }} 引用：请在 inputs 声明需要的值，命令通过环境变量读取（见 RB_TASK、RB_STEP_<ID>_OUTPUT、RB_STEP_<ID>_EXIT_CODE、RB_FILE_<序号>）', 'run');
+        }
         timeout(s.timeoutSec);
         const ok = s.okExitCodes;
         if (ok !== undefined && (!Array.isArray(ok) || !ok.length || !ok.every((c) => typeof c === 'number' && Number.isInteger(c)))) {
           err('okExitCodes 必须是非空的整数列表', 'okExitCodes');
         }
         outputSpec(s.output);
-        checkTemplated(run, 'run', s.inputs);
+        checkDeclared(s.inputs);
         break;
       }
       case 'approval': {
@@ -284,6 +324,10 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
             if (ref) checkRef(ref, 'show');
             else err('show 中有无法识别的项', 'show');
           }
+        }
+        if (s.message !== undefined) {
+          if (typeof s.message !== 'string') err('message 必须是文本', 'message');
+          else checkTemplated(s.message, 'message');
         }
         break;
       }

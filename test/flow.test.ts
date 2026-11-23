@@ -102,7 +102,7 @@ test('file references: must be relative and stay inside the worktree', () => {
 
 test('unknown reference syntax inside any templated field is an error', () => {
   assert.ok(has(errors(flow([agent('a', { prompt: '{{nope}}' })])), '不支持的引用'));
-  assert.ok(has(errors(flow([command('c', { run: 'echo {{nope}}' })])), '不支持的引用'));
+  assert.ok(has(errors(flow([command('c', { run: 'echo {{nope}}' })])), '环境变量'));
   const commit = { id: 'cm', title: 'cm', type: 'commit', message: '{{nope}}' } as Workflow['steps'][number];
   assert.ok(has(errors(flow([commit], { mode: 'explicit-step' })), '不支持的引用'));
 });
