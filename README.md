@@ -82,7 +82,7 @@ The dashboard remembers projects and shows progress, diffs, and reports. Each Gi
 
 Open **全局 Agent** in the sidebar to check local Codex and Claude Code sign-in status, add an API connection (**添加 API**), or configure a non-interactive executable (**添加命令**). The form saves to per-user `agents.json`. Supply API keys through environment variables. If you have an existing YAML config, **从 YAML 导入** loads its `agents` into the form for review before saving.
 
-Use a project's **配置** page to set stage defaults and edit any custom command already defined in that project's YAML. When creating a task, choose an Agent and model for each stage to override those defaults for that task. RepoBaton keeps the task's choices through approval and resume. Implementer retries can continue the original CLI session for that task. Planning and review use separate sessions. For example, enable plan approval and keep the default Claude Code and Codex split:
+Use a project's **配置** page to set stage defaults and edit any custom command already defined in that project's YAML. When creating a task, choose an Agent and model for each stage to override those defaults for that task. RepoBaton keeps the task's choices through approval and resume. Implementer retries can continue the original CLI session for that task. Planning and each review round use separate sessions (see Native sessions). For example, enable plan approval and keep the default Claude Code and Codex split:
 
 ```yaml
 stages:
@@ -118,6 +118,16 @@ node bin\repobaton.mjs ui
 - `.repobaton/runs/<run-id>/` in each project holds the run state, event log, report, and artifacts. The default worktree directory is `.repobaton/worktrees/`.
 
 </details>
+
+## Native sessions
+
+Every stage call (plan, implement, review, release draft) is recorded in the run with its agent, session id, working directory and status. Codex and Claude Code stage sessions are kept on disk. Open a task and look at the native sessions card: it shows each stage, with buttons to copy the session id and a resume command that starts in the recorded worktree.
+
+- Implementer retries continue the same implement session. Each review round keeps its own session.
+- Agents that report no session id (API and command agents) show their RepoBaton events and results only, with no native session entry.
+- Runs saved before this feature show that the native session cannot be located. Their details and artifacts stay available.
+
+Verified on Windows with Codex CLI 0.171.0-alpha.13 and Claude Code 2.1.319: a session created by RepoBaton resumes by id (`codex exec resume <id>`, `claude --resume <id>`) from its recorded worktree and remembers the earlier work. Codex records the working directory in its session file under `~/.codex/sessions`, and Claude Code stores sessions under `~/.claude/projects`. Whether the Codex desktop app lists sessions created by the CLI has not been verified, so this page does not promise it.
 
 ## Recovery
 
