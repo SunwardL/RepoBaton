@@ -46,11 +46,12 @@ async function makeRepo(): Promise<string> {
 const plan = { summary: 's', steps: [{ title: 't', detail: 'd', files: ['value.txt'] }], acceptance: ['value.txt says good'], risks: [], test_hints: [] };
 const release = { version_bump: 'patch', suggested_version: '1.0.1', pr_title: 'x', pr_body: 'b', release_notes: 'n', risks: [] };
 
-function setup(repo: string, agents: Record<string, Fake>, maxRounds = 3): Pipeline {
+function setup(repo: string, agents: Record<string, Fake>, maxRounds = 3, fallbackAgent?: string): Pipeline {
   const config = defaultConfig();
   config.agents = { planner: { type: 'command', command: 'x' }, coder: { type: 'command', command: 'x' }, judge: { type: 'command', command: 'x' } };
   config.stages.plan.agent = 'planner';
   config.stages.implement.agent = 'coder';
+  config.stages.implement.fallbackAgent = fallbackAgent;
   config.stages.review.agent = 'judge';
   config.stages.release.agent = 'judge';
   config.stages.implement.retries = 0;
@@ -108,6 +109,21 @@ test('a run that never passes stops as needs-human after maxReviewRounds', async
   assert.equal(state.rounds.length, 2);
   assert.equal(state.release, undefined, 'no release draft for unapproved work');
   assert.equal(judgeAgent.calls.length, 2);
+});
+
+test('a retry only passes a native session ID to the agent that created it', async () => {
+  const repo = await makeRepo();
+  const planner = new Fake('planner', () => plan);
+  const coder = new Fake('coder', () => { throw new Error('primary unavailable'); });
+  const backup = new Fake('backup', async (req, n) => {
+    await fs.writeFile(path.join(req.cwd, 'value.txt'), n === 1 ? 'bad\n' : 'good\n');
+    return 'done';
+  });
+  const judge = new Fake('judge', (req) => req.stage === 'release' ? release : { verdict: 'approve', summary: 'ok', issues: [] });
+  const state = await setup(repo, { planner, coder, backup, judge }, 3, 'backup').start('retry only the owning session');
+  assert.equal(state.status, 'succeeded', state.error);
+  assert.equal(coder.calls[1].sessionId, undefined);
+  assert.equal(backup.calls[1].sessionId, 's-1');
 });
 
 test('plan approval pauses the run until approved', async () => {
@@ -219,4 +235,70 @@ test('a run without an interactive approver always stops at the plan', async () 
   const paused = await pipe.start('make value good');
   assert.equal(paused.status, 'awaiting-plan-approval');
   assert.equal((agents.coder as Fake).calls.length, 0);
+});
+
+// ------------------------------------------------------------------ native sessions are recorded per stage
+
+/** Same as Fake, but reports a native agent type and always returns a session id, like the real CLIs. */
+class Native extends Fake {
+  override type = 'codex-cli' as unknown as 'command';
+  constructor(id: string, kind: 'codex-cli' | 'claude-cli', handler: ConstructorParameters<typeof Fake>[1]) {
+    super(id, handler);
+    this.type = kind as unknown as 'command';
+  }
+  override async run(req: AgentRunRequest): Promise<AgentResult> {
+    const res = await super.run(req);
+    return { ...res, sessionId: this.id + '-' + this.calls.length };
+  }
+}
+
+test('every stage call is recorded as a session; native agents are asked to keep theirs, others are not', async () => {
+  const repo = await makeRepo();
+  const planner = new Native('planner', 'claude-cli', () => plan);
+  const coder = new Native('coder', 'codex-cli', async (req, n) => {
+    await fs.writeFile(path.join(req.cwd, 'value.txt'), n === 1 ? 'bad\n' : 'good\n');
+    return 'round ' + n;
+  });
+  const judgeAgent = new Fake('judge', (req) => {
+    if (req.prompt.includes('RELEASE MANAGER')) return release;
+    return { verdict: 'approve', summary: 'ok', issues: [] };
+  });
+  const state = await setup(repo, { planner, coder, judge: judgeAgent }).start('make value good');
+  assert.equal(state.status, 'succeeded', state.error);
+  const labels = (state.sessions ?? []).map((s) => s.label);
+  assert.deepEqual(labels, ['plan', 'implement-r1', 'review-r1', 'implement-r2', 'review-r2', 'release']);
+  assert.ok(planner.calls.every((c) => c.persist === true), 'a native planner keeps its session');
+  assert.ok(coder.calls.every((c) => c.persist === true), 'a native implementer keeps its session');
+  assert.ok(judgeAgent.calls.every((c) => !c.persist), 'a non-native agent is not asked to persist');
+  const byLabel = Object.fromEntries((state.sessions ?? []).map((s) => [s.label, s]));
+  assert.equal(byLabel['plan'].agentType, 'claude-cli');
+  assert.equal(byLabel['plan'].sessionId, 'planner-1');
+  assert.equal(byLabel['implement-r1'].sessionId, 'coder-1');
+  assert.equal(byLabel['implement-r1'].round, 1);
+  assert.equal(byLabel['review-r2'].round, 2);
+  assert.equal(byLabel['review-r1'].agentType, 'command');
+  assert.equal(byLabel['review-r1'].sessionId, undefined, 'only agents that report a session id have one');
+  assert.equal(byLabel['review-r1'].persisted, false);
+  for (const s of state.sessions ?? []) {
+    assert.equal(s.status, 'completed');
+    assert.ok(s.finishedAt);
+    assert.equal(s.cwd, state.worktree);
+  }
+});
+
+test('a failed agent call leaves a failed session record, and the records survive a reload', async () => {
+  const repo = await makeRepo();
+  const planner = new Native('planner', 'claude-cli', () => {
+    throw new Error('boom');
+  });
+  const coder = new Fake('coder', () => 'x');
+  const judgeAgent = new Fake('judge', () => release);
+  const pipe = setup(repo, { planner, coder, judge: judgeAgent });
+  const state = await pipe.start('anything').catch(() => null);
+  const stored = await pipe.store.load((state?.id ?? (await pipe.store.resolve('last'))));
+  const first = stored.sessions?.[0];
+  assert.equal(first?.label, 'plan');
+  assert.equal(first?.status, 'failed');
+  assert.ok(first?.finishedAt);
+  assert.equal(first?.sessionId, undefined);
 });

@@ -4,6 +4,7 @@ import { ActionPanel } from './ActionPanel';
 import { Banner, dur, errorText, ERROR_HINT, Pill, usePoll } from './common';
 import { EventLog } from './EventLog';
 import { DiffView, PlanBox, RoundCard } from './RunParts';
+import { SessionsCard } from './SessionsCard';
 
 type Tab = 'progress' | 'plan' | 'diff' | 'report';
 
@@ -121,6 +122,15 @@ export function RunView({ projectId, runId, notify, onBack }: { projectId: strin
         ))}
       </div>
 
+      {run.workflow && (
+        <section className="run-workflow" aria-label="本次任务编排">
+          {STAGES.map((stage) => {
+            const selection = run.workflow?.[stage.key as keyof NonNullable<RunDetail['workflow']>];
+            return selection ? <span className="chip" key={stage.key}>{stage.label} · {selection.agent}{selection.model && ` / ${selection.model}`}</span> : null;
+          })}
+        </section>
+      )}
+
       <div className="stack">
         <ActionPanel projectId={projectId} run={run} executing={executing} notify={notify} onChanged={() => void load()} />
       </div>
@@ -139,6 +149,7 @@ export function RunView({ projectId, runId, notify, onBack }: { projectId: strin
           </div>
           <div className="stack">
             <div className="card sec"><h2>实时进度</h2><EventLog events={events} /></div>
+            <SessionsCard run={run} />
             <div className="card sec">
               <h2>用量</h2>
               <div className="kv">Agent 调用<b>{run.usage.calls}</b></div>

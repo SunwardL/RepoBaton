@@ -1,104 +1,145 @@
-# RepoBaton
+<h1 align="center">RepoBaton</h1>
 
-Let Codex, Claude Code and OpenAI/Anthropic-compatible models work on one task as planner, implementer, reviewer and release manager. Stages hand work over through files and git commits; the orchestrator, not an AI, decides the next step.
+<p align="center"><strong>Local workflows for Codex, Claude Code, and compatible agents</strong></p>
+
+<p align="center">Hand a Git task from planning to implementation and review.<br>Follow every step from your browser or terminal.</p>
+
+<p align="center">
+  <a href="https://github.com/SunwardL/RepoBaton/releases/latest"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/SunwardL/RepoBaton?style=flat-square&amp;color=5267df"></a>
+  <img alt="Node.js 22.18 or newer" src="https://img.shields.io/badge/Node.js-22.18%2B-3c873a?style=flat-square">
+  <img alt="Local web UI" src="https://img.shields.io/badge/Web_UI-localhost-334155?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> &middot;
+  <a href="#how-it-works">Workflow</a> &middot;
+  <a href="#configuration">Configuration</a> &middot;
+  <a href="#recovery">Recovery</a>
+</p>
+
+<p align="center">
+  <img src="assets/readme/repobaton-ui.png" width="960" alt="RepoBaton's local dashboard showing two sample projects and a health check implementation plan awaiting approval">
+  <br><sub>The local dashboard with an example plan ready for approval.</sub>
+</p>
 
 ## Quick start
 
-```
-npm install
-node bin/repobaton.mjs doctor      # check CLIs, API keys, git, gh
-node bin/repobaton.mjs init        # detect CLIs and write repobaton.yaml
-node bin/repobaton.mjs run "your task" -v
-```
+You need **Node.js 22.18+**, **Git**, and a Git project with at least one commit. The default workflow uses locally authenticated Claude Code and Codex CLIs. You can also [configure API agents or another CLI](#configuration).
 
-Flow: plan -> implement (isolated git worktree) -> test -> independent review -> fix loop -> release draft. Nothing is pushed unless you enable publish steps (--push, --pr, --merge, --tag).
-
-## Local web UI (`repobaton ui`)
-
-```
-npm install
-npm run install:web     # once: installs the UI's dependencies
-npm run build           # server + web UI
-node bin/repobaton.mjs ui [--port <n>] [--no-open] [--project <dir>]...
+```shell
+git clone https://github.com/SunwardL/RepoBaton.git
+cd RepoBaton
+npm ci
+npm run install:web
+npm run build
+node bin/repobaton.mjs ui
 ```
 
-It prints a URL such as `http://127.0.0.1:8787/#token=...` and opens it. The server listens on `127.0.0.1` only. The token is random per launch and lives in the URL fragment, so it is never sent over the network; a page without it, a foreign `Host` or a foreign `Origin` is refused. If the page says it needs reopening, use the full URL from the terminal again.
+Add your project from the sidebar, then create a task. You can also add a project when starting the server:
 
-From the UI you can add projects, create a task, watch live progress, approve a plan or reject it with comments, continue, cancel, and read the diff, release draft and report.
-
-### Environment variables and secrets
-
-The server reads API keys from the environment of the process that started `repobaton ui` (for example `OPENAI_API_KEY`, or whatever `apiKeyEnv` names). Set them before you start it:
-
+```shell
+node bin/repobaton.mjs ui --project ../your-project --port 8787
 ```
-set OPENAI_API_KEY=...
+
+The server listens on `127.0.0.1`. The command prints a launch URL with a token generated for that server session. Use that full URL if the page asks you to reopen it. Add `--no-open` to skip opening the browser automatically.
+
+<details>
+<summary><strong>Run from the terminal</strong></summary>
+
+Run these commands from the RepoBaton checkout, substituting your project path:
+
+```shell
+node bin/repobaton.mjs doctor --repo ../your-project
+node bin/repobaton.mjs init --repo ../your-project
+node bin/repobaton.mjs run "Add a health check endpoint" --repo ../your-project --approve-plan -v
+```
+
+`init` writes a starter `repobaton.yaml` into the project. The CLI can also approve or reject a pending plan, follow a run live, and print its Markdown report. See `node bin/repobaton.mjs help` for the full command list.
+
+</details>
+
+## How it works
+
+```mermaid
+flowchart LR
+    P[Plan] --> I[Implement]
+    I --> T[Test]
+    T --> R[Review]
+    R -->|Changes requested| I
+    R -->|Approved| D[Release draft]
+```
+
+| Stage | What happens |
+| --- | --- |
+| **Plan** | Turn the task into steps and acceptance criteria. With plan approval enabled, approve the specific plan you reviewed or send feedback for a revision. |
+| **Implement** | Edit in a dedicated Git worktree and record a commit for the round. |
+| **Test and review** | Run the project's test command, then review the commit in a fresh session. By default, failed tests and blocking findings require another round. |
+| **Release draft** | Collect the approved change, a suggested version, PR text, and release notes. Remote publish steps are opt-in. |
+
+The dashboard remembers projects and shows progress, diffs, and reports. Each Git repository can run one task at a time, including its linked worktrees. Separate repositories can run at the same time. When a repository is busy, the dashboard asks you to try again after the active run stops.
+
+## Configuration
+
+Open **全局 Agent** in the sidebar to check local Codex and Claude Code sign-in status, add an API connection (**添加 API**), or configure a non-interactive executable (**添加命令**). The form saves to per-user `agents.json`. Supply API keys through environment variables. If you have an existing YAML config, **从 YAML 导入** loads its `agents` into the form for review before saving.
+
+Use a project's **配置** page to set stage defaults and edit any custom command already defined in that project's YAML. When creating a task, choose an Agent and model for each stage to override those defaults for that task. RepoBaton keeps the task's choices through approval and resume. Implementer retries can continue the original CLI session for that task. Planning and review use separate sessions. For example, enable plan approval and keep the default Claude Code and Codex split:
+
+```yaml
+stages:
+  plan:
+    agent: claude
+    requireApproval: true
+  implement:
+    agent: codex
+  review:
+    agent: claude
+```
+
+| Agent type | Connection |
+| --- | --- |
+| `claude-cli`, `codex-cli` | Use each CLI's local login. |
+| `openai-compatible` | Use a Chat Completions endpoint with `baseUrl`, `model`, and `apiKeyEnv`. |
+| `anthropic-compatible` | Use a Messages endpoint with `baseUrl`, `model`, and `apiKeyEnv`. |
+| `command` | Use a configured command that accepts a prompt and returns a result. |
+
+Set API keys in the environment **before** starting RepoBaton. If a key is missing, the dashboard shows the agent and environment variable name. For example, in Windows Command Prompt:
+
+```cmd
+set OPENAI_API_KEY=your-key-here
 node bin\repobaton.mjs ui
 ```
 
-Nothing stores or writes keys. If an enabled stage uses an API agent whose variable is not set, the project page names the agent and the variable (not a value), and new runs, approvals and resumes are refused until you restart with it set. Key values never appear in API responses, the UI or `server.log`. CLI agents (`claude`, `codex`) use their own logins.
+<details>
+<summary><strong>CLI paths, test commands, and storage</strong></summary>
 
-Other variables: `REPOBATON_HOME` overrides the per-user data folder (default `%APPDATA%\repobaton`, holding `projects.json` and `server.log`); `REPOBATON_CLAUDE_PATH` and `REPOBATON_CODEX_PATH` as below.
+- Claude Code and Codex are resolved from `agents.<id>.path`, `REPOBATON_CLAUDE_PATH` or `REPOBATON_CODEX_PATH`, `PATH`, then known install locations. An invalid explicit path is reported immediately.
+- Set `test.command` or `test.setup` to override detection. Use `loop.maxReviewRounds`, `loop.blockOn`, and `loop.testsMustPass` to tune the review loop.
+- The project list lives in a per-user data directory, `%APPDATA%\repobaton` on Windows by default. Set `REPOBATON_HOME` to change it.
+- `.repobaton/runs/<run-id>/` in each project holds the run state, event log, report, and artifacts. The default worktree directory is `.repobaton/worktrees/`.
 
-### Several projects
+</details>
 
-- The project list is a small file, `projects.json`, in the per-user folder. It survives restarts.
-- Each project reads its own `repobaton.yaml` on every request. The config is never written back.
-- A repository's identity is `git rev-parse --git-common-dir`, resolved to a real path (relative paths, drive-letter and folder casing, 8.3 short names and links all collapse to one). The main folder, any subfolder and every linked worktree are the **same project**.
-- **One execution at a time per repository.** Two different repositories can each run a task at the same time. Anything that starts executing (new task, approve, reject, resume) takes the repository's slot before doing any work and gives it back when the run finishes or stops for approval. If it is taken you get a "busy" message at once; nothing is queued. A duplicate or stale approval (the run already moved on) is refused and cannot start a second execution.
+## Recovery
 
-### Interrupted runs and recovery
+If the local server can confirm that it previously owned a run and its owner process is gone, it shows the run as **Interrupted**. Choose **Continue** to pick up from a saved checkpoint. If a commit already passed review, recovery carries that SHA into the remaining steps. Cleanup removes the selected worktree and keeps its branch and commits. Use the UI or the standalone CLI to manage a given run.
 
-When the server stops while a run is executing (closed terminal, crash, reboot), the run stays `running` on disk. The next time the project is loaded the server marks it **Interrupted** (distinct from **Failed** and **Awaiting approval**) and offers **Continue**. The worktree, branch, commits, plan, approvals and report are kept, and Continue resumes from the last checkpoint rather than from scratch.
+<details>
+<summary><strong>Recover an interrupted push, PR, merge, or tag</strong></summary>
 
-- Only runs this server can prove it owned are touched: each server run records the server's pid and start time. A run started by the plain CLI has no owner and is never marked interrupted. If the old pid is still alive, or its liveness cannot be checked, the run is left alone.
-- Push, PR, merge and tag are recorded as "in flight" before they happen. If a run was interrupted in the middle of one, nobody can tell whether it happened, so Continue is blocked and nothing is repeated. Use "Check the remote" on the run page (or `repobaton check <run>` from a standalone CLI): the remote is asked read-only (branch commit, PR state and merge commit, tag target) and only what it confirms is recorded, such as the PR URL, the merge commit or the tag. "Completed" is accepted without remote proof only with matching evidence (the pushed commit, a PR URL, a full merge SHA); "did not happen" is accepted only when the remote shows it did not. The check always targets the place the operation wrote to, recorded when it started: the remote name and its **push** address without credentials (the address `git push` uses, which can differ from the fetch address), and for pull requests the GitHub repository (`github.com/owner/name`). `gh` is always told that repository explicitly instead of guessing it from the directory. If the push address or repository now differs, or the remote was removed, nothing is queried and nothing can be recorded, even with evidence. A branch or tag missing from the fetch address proves nothing; only the push address is asked.
-  Supported: one push address per remote (`pushurl`/`insteadOf` are honoured), and for PR steps a github.com address (https, ssh or scp-style). A remote with several push addresses, or a PR step on another host, stops before anything is written, with a message saying so.
-  Tagging: the merge commit is fetched from the push address (the repository the PR was merged in, which can differ from the fetch address) and must be on its base branch before it is tagged. If that repository has no such branch or does not contain the commit, nothing is tagged and the run pauses with a message saying so. The same holds when the remote answers but shows something different (a branch, PR or tag at another commit): that conflict is never overridden by hand, fix it on the remote and check again. If the remote merely cannot be reached or does not answer clearly, the run stays paused, and evidence you supply can still settle it. Runs interrupted before this recording existed have no recorded remote and can only be settled with evidence.
-- Approving or rejecting a plan names the plan version you were looking at. If the plan changed since (for example it was rejected in another window and a new one is pending), the request is refused with a "refresh" message and nothing starts.
-- Resuming a run that already has an approved commit continues from release/publish with that exact commit; it never starts a new implement round, even when the round budget is used up. A saved worktree whose setup did not finish gets its setup completed.
-- **Clean up** removes only the worktree folder of the run you select (the branch and commits stay). It takes the repository's execution slot like resume and approve do, so it is refused while anything else is executing in that repository, and nothing can start using the worktree while it is being removed.
-- Credentials are masked before upstream or git/gh error text reaches run state, events, reports, logs, the API or the UI. Agent names, environment variable names and error categories stay readable.
+Use **Check the remote** in the dashboard or `repobaton check <run>` in the CLI. Recovery checks the original push destination and, for PR steps, the recorded GitHub repository. A changed destination or a conflicting result keeps the run paused. When a lookup cannot settle the outcome, the check may accept matching evidence such as a commit SHA or PR URL. Older records without a stored destination require evidence.
 
-**Do not drive the same run from a standalone CLI while the UI server manages it.** The server owns the run's state; use either the UI or the CLI for a given run.
+Remote publishing requires one push address per remote. PR operations require `github.com` and an authenticated `gh`. Tags point to a merge commit verified on the base branch at the push destination. GitHub publishing stays off unless you enable it in the project configuration or pass explicit publishing flags to the CLI.
 
-## Finding the CLIs
-
-For claude and codex the path is resolved in this order:
-
-1. `agents.<id>.path` in repobaton.yaml
-2. environment variable `REPOBATON_CLAUDE_PATH` / `REPOBATON_CODEX_PATH`
-3. PATH
-4. known install locations (for Codex this includes `~/.codex/plugins/.plugin-appserver`, preferring installs that ship the code-mode host)
-
-An explicit path that does not run is an error; it never silently falls back.
-
-## Per-stage agents and models
-
-Each stage picks an agent and optionally a model and effort. Command-line overrides: `--plan`, `--implement`, `--review`, `--release` and the matching `--*-model` flags. Loop control: `loop.maxReviewRounds`, `loop.blockOn`, `loop.testsMustPass`, and `--max-rounds`.
-
-## Agent types
-
-- `claude-cli`, `codex-cli`: use the local login of each CLI.
-- `openai-compatible`: Chat Completions endpoint, set `baseUrl`, `model`, `apiKeyEnv`.
-- `anthropic-compatible`: Messages endpoint, same fields.
-- `command`: any other CLI that reads a prompt and prints an answer.
-
-API agents get sandboxed file tools limited to the worktree. Read-only stages get no write tool and no shell.
-
-## Safety
-
-- Review is read-only and runs in a fresh session; the orchestrator overrides an approve if tests fail or blocking issues exist.
-- Merge uses the exact approved commit.
+</details>
 
 ## Development
 
-```
+```shell
+npm ci
 npm run install:web
-npm run typecheck      # server + web
+npm run typecheck
 npm test
-npm run build          # tsc -> dist, vite -> web/dist, copied to dist/web
+npm run build
 ```
 
-The UI is in `web/` (Vite, React, TypeScript). For UI work run `npm --prefix web run dev` with `REPOBATON_URL` pointing at a running `repobaton ui`.
-
-Limits: single user, local only. There is no queueing of Git operations, global scheduler, concurrency setting, cross-process lock or key storage.
+The CLI and local server live in `src/`. The React dashboard lives in `web/`, and the build copies its assets into `dist/web`.

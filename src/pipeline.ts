@@ -22,8 +22,10 @@ import {
   type Round,
   type RunState,
   type StageName,
+  type StageSession,
 } from './types.ts';
 import { formatFeedback, judge } from './verdict.ts';
+import { withWorkflow } from './workflow.ts';
 import { redactDeep, redactDiagnostic } from './redact.ts';
 import { ensureDir, nowIso, sleep, slugify, tail, truncate, validateSchema, readJson, exists } from './util.ts';
 
@@ -66,6 +68,7 @@ const MAX_RAW_ARTIFACT = 2_000_000;
 export class Pipeline {
   readonly store: RunStore;
   private cfg: Config;
+  private baseConfig: Config;
   private log: Logger;
   private baseLog: Logger;
   private events: EventSink = noopSink;
@@ -79,7 +82,7 @@ export class Pipeline {
     this.opts = opts;
     this.ops = opts.remote ?? G.realRemoteOps;
     this.repo = opts.repo;
-    this.cfg = opts.publishOverride
+    this.baseConfig = this.cfg = opts.publishOverride
       ? { ...opts.config, publish: { ...opts.config.publish, ...opts.publishOverride } }
       : opts.config;
     this.baseLog = opts.log ?? silentLogger;
@@ -92,7 +95,8 @@ export class Pipeline {
   // ------------------------------------------------------------------ entry points
 
   /** onCreated fires as soon as the run exists, so a caller can show it before the (long) execution ends. */
-  async start(task: string, onCreated?: (id: string) => void): Promise<RunState> {
+  async start(task: string, onCreated?: (id: string) => void, workflow?: RunState['workflow']): Promise<RunState> {
+    this.cfg = withWorkflow(this.baseConfig, workflow);
     task = task.trim();
     if (!task) throw new PipelineError('task description is empty');
     if (!(await G.hasCommits(this.repo))) {
@@ -102,6 +106,7 @@ export class Pipeline {
     const state: RunState = {
       id,
       task,
+      workflow,
       repo: this.repo,
       status: 'running',
       createdAt: nowIso(),
@@ -126,6 +131,7 @@ export class Pipeline {
       this.log.info('run already succeeded; nothing to do');
       return state;
     }
+    this.cfg = withWorkflow(this.baseConfig, state.workflow);
     if (state.status === 'awaiting-plan-approval' && !ropts.approvePlan && !ropts.feedback && !this.opts.approvePlan) {
       throw new PipelineError('this run is waiting for plan approval: use "repobaton approve <run>"', 'awaiting-plan-approval');
     }
@@ -281,6 +287,7 @@ export class Pipeline {
     stage: StageName,
     label: string,
     req: Pick<AgentRunRequest, 'prompt' | 'access' | 'schema' | 'sessionId' | 'persist'>,
+    sessionAgent?: string,
   ): Promise<AgentResult & { agentId: string }> {
     const sc = this.cfg.stages[stage];
     const chain = [sc.agent, ...(sc.fallbackAgent ? [sc.fallbackAgent] : [])];
@@ -295,9 +302,25 @@ export class Pipeline {
           stage,
           data: { label, agent: agentId, attempt: n, access: req.access },
         });
+        // Native Codex and Claude Code stage sessions are kept on disk so the user can find and continue them.
+        const isNative = agent.type === 'codex-cli' || agent.type === 'claude-cli';
+        const session: StageSession = {
+          label,
+          stage,
+          round: Number(/-r(\d+)/.exec(label)?.[1]) || undefined,
+          agent: agentId,
+          agentType: agent.type,
+          persisted: isNative || !!req.persist,
+          cwd: state.worktree!,
+          status: 'running',
+          startedAt: nowIso(),
+        };
+        (state.sessions ??= []).push(session);
+        await this.store.save(state);
         try {
           const res = await agent.run({
             ...req,
+            persist: isNative ? true : req.persist,
             stage,
             cwd: state.worktree!,
             // Stage-level model/effort only apply to the stage's primary agent.
@@ -305,7 +328,7 @@ export class Pipeline {
             effort: idx === 0 ? sc.effort : undefined,
             timeoutMs: (sc.timeoutSec ?? 900) * 1000,
             signal: this.signal,
-            sessionId: idx === 0 ? req.sessionId : undefined,
+            sessionId: agentId === sessionAgent ? req.sessionId : undefined,
             onProgress: (l) => {
               this.log.detail(l);
               this.events.emit('agent.progress', l.slice(0, 300), { stage, data: { label, agent: agentId } });
@@ -315,6 +338,9 @@ export class Pipeline {
             const errs = validateSchema(req.schema, res.structured);
             if (errs.length) throw new AgentError(`structured output invalid: ${errs.slice(0, 3).join('; ')}`);
           }
+          session.status = 'completed';
+          session.finishedAt = nowIso();
+          session.sessionId = res.sessionId;
           state.usage.calls++;
           state.usage.costUsd += res.costUsd ?? 0;
           state.usage.inputTokens += res.inputTokens ?? 0;
@@ -328,6 +354,8 @@ export class Pipeline {
           return { ...res, agentId };
         } catch (e) {
           lastErr = e as Error;
+          session.status = 'failed';
+          session.finishedAt = nowIso();
           if (this.signal?.aborted || lastErr.message === 'cancelled') throw new AgentError('cancelled', false);
           const retryable = !(e instanceof AgentError) || e.retryable;
           this.log.warn(`${stage}/${agentId} failed: ${lastErr.message}`);
@@ -477,19 +505,21 @@ export class Pipeline {
         round: round.n - 1,
         test_hint: testHint,
       });
-      const sessionId = this.cfg.loop.resumeImplementerSession
-        ? [...state.rounds].reverse().find((r) => r.implement?.sessionId)?.implement?.sessionId
+      const implementStage = this.cfg.stages.implement;
+      const previousSession = this.cfg.loop.resumeImplementerSession
+        ? [...state.rounds].reverse().find((r) => r.implement?.sessionId &&
+          [implementStage.agent, implementStage.fallbackAgent].includes(r.implement.agent))?.implement
         : undefined;
       let res;
       try {
         res = await this.invoke(state, 'implement', `implement-r${round.n}`, {
           prompt,
           access: 'workspace-write',
-          sessionId,
+          sessionId: previousSession?.sessionId,
           persist: this.cfg.loop.resumeImplementerSession,
-        });
+        }, previousSession?.agent);
       } catch (e) {
-        if (!sessionId || e instanceof PipelineError === false) throw e;
+        if (!previousSession || e instanceof PipelineError === false) throw e;
         this.log.warn('could not resume the implementer session; starting a fresh one with full context');
         res = await this.invoke(state, 'implement', `implement-r${round.n}b`, {
           prompt,

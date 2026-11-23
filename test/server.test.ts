@@ -160,6 +160,7 @@ async function harness(
   const agentRegistry = { get: () => agent } as unknown as AgentRegistry;
   const srv = await startServer({
     registry,
+    agentsFile: path.join(path.dirname(regFile), 'agents.json'),
     seedProjects: repos,
     serverId: o.serverId,
     probe: o.probe,
@@ -214,7 +215,135 @@ async function waitFor<T>(fn: () => Promise<T | undefined | false>, ms = 20000):
 const runsPath = (pid: string, id?: string, tail = ''): string => `/api/projects/${pid}/runs${id ? `/${id}` : ''}${tail}`;
 const statusOf = async (h: Harness, pid: string, id: string): Promise<string> => (await h.call('GET', runsPath(pid, id))).json.run.status;
 const planVer = async (h: Harness, pid: string, id: string): Promise<number> => (await h.call('GET', runsPath(pid, id))).json.run.planVersion;
+
+test('project settings save only editable fields and protect credentials and external edits', async () => {
+  const repo = await makeRepo();
+  const file = path.join(repo, 'repobaton.yaml');
+  const secret = 'sk-settings-fixture-secret';
+  const original = (await fs.readFile(file, 'utf8')).replace(
+    'agents:',
+    `# Keep this comment\nagents:\n  extra: { type: openai-compatible, model: test, apiKey: ${secret} }`,
+  );
+  await fs.writeFile(file, original);
+  const h = await harness([repo]);
+  const endpoint = `/api/projects/${h.projectIds[0]}/settings`;
+  try {
+    const opened = await h.call('GET', endpoint);
+    assert.equal(opened.status, 200);
+    assert.doesNotMatch(JSON.stringify(opened.json), new RegExp(secret));
+    const checked = await h.call('POST', endpoint + '/check', {});
+    assert.equal(checked.status, 200);
+    assert.equal(checked.json.agents.find((a: { id: string }) => a.id === 'extra').status, 'key-present');
+    assert.doesNotMatch(JSON.stringify(checked.json), new RegExp(secret));
+
+    const { revision } = opened.json;
+    assert.equal((await h.call('PUT', endpoint, { revision, stages: { plan: { agent: 'missing' } } })).status, 422);
+    assert.equal(await fs.readFile(file, 'utf8'), original);
+    const saved = await h.call('PUT', endpoint, { revision, requireApproval: false, stages: { implement: { model: 'demo-model' } } });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json.requireApproval, false);
+    assert.equal(saved.json.stages.find((s: { name: string }) => s.name === 'implement').model, 'demo-model');
+    const source = await fs.readFile(file, 'utf8');
+    assert.match(source, /# Keep this comment/);
+    assert.match(source, new RegExp(secret));
+    assert.match(source, /retries: 0/);
+
+    await fs.appendFile(file, '# edited outside UI\n');
+    const stale = await h.call('PUT', endpoint, { revision: saved.json.revision, requireApproval: true });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.json.error.code, 'stale-config');
+    assert.equal(await fs.readFile(file, 'utf8'), source + '# edited outside UI\n');
+  } finally {
+    await h.close();
+  }
+});
+test('command settings can be edited and YAML import stays a preview until saved', async () => {
+  const repo = await makeRepo();
+  const file = path.join(repo, 'repobaton.yaml');
+  const secret = 'fixture-sensitive-value';
+  await fs.writeFile(file, (await fs.readFile(file, 'utf8')).replace(
+    'command: x', `command: x, args: ['--token', '${secret}'], timeoutMs: 5000`,
+  ));
+  const h = await harness([repo]);
+  const endpoint = `/api/projects/${h.projectIds[0]}/settings`;
+  const globalEndpoint = '/api/agents';
+  try {
+    const before = await h.call('GET', globalEndpoint);
+    const preview = await h.call('POST', globalEndpoint + '/import', {
+      yaml: [
+        'agents:',
+        '  local-tool:', '    type: command', '    command: node', '    args: [runner.mjs, "one argument"]', '    promptVia: arg',
+        `  local-api: { type: openai-compatible, model: demo, apiKey: ${secret} }`,
+      ].join('\n'),
+    });
+    assert.equal(preview.status, 200);
+    assert.deepEqual(preview.json.agents.find((a: { id: string }) => a.id === 'local-tool').args, ['runner.mjs', 'one argument']);
+    assert.equal(preview.json.agents.find((a: { id: string }) => a.id === 'local-api').apiKeyEnv, 'OPENAI_API_KEY');
+    assert.ok(!JSON.stringify(preview.json).includes(secret));
+    assert.deepEqual((await h.call('GET', globalEndpoint)).json, before.json);
+    const saved = await h.call('PUT', globalEndpoint, { revision: before.json.revision, agents: [...before.json.agents, ...preview.json.agents] });
+    assert.equal(saved.status, 200);
+    assert.ok(!String(await fs.readFile(saved.json.file, 'utf8')).includes(secret));
+
+    const project = await h.call('GET', endpoint);
+    assert.deepEqual(project.json.commandAgents.map((a: { id: string }) => a.id), ['a']);
+    assert.ok(project.json.agents.some((a: { id: string }) => a.id === 'local-tool'));
+    assert.ok(!JSON.stringify(project.json).includes(secret));
+    const payload = { revision: project.json.revision, commands: { a: { command: 'node', args: ['runner.mjs'], promptVia: 'arg', output: 'text' } } };
+    assert.equal((await h.call('PUT', endpoint, {
+      ...payload, commands: { a: { ...payload.commands.a, args: [`--token=${secret}`] } },
+    })).status, 422);
+    const edited = await h.call('PUT', endpoint, payload);
+    assert.equal(edited.status, 200);
+    assert.deepEqual(edited.json.commandAgents, [{ id: 'a', ...payload.commands.a }]);
+    assert.equal(edited.json.stages.find((s: { name: string }) => s.name === 'plan').agent, 'a');
+    assert.match(await fs.readFile(file, 'utf8'), /timeoutMs: 5000/);
+  } finally {
+    await h.close();
+  }
+});
 const idle = async (h: Harness, pid: string): Promise<boolean> => !(await h.call('GET', '/api/projects')).json.projects.find((p: any) => p.id === pid).busy;
+
+test('global API agents are available in existing projects and task models survive approval', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const keyEnv = 'RB_GLOBAL_WORKFLOW_TEST_KEY';
+  const secret = 'sk-fixture-global-only';
+  process.env[keyEnv] = secret;
+  try {
+    const global = (await h.call('GET', '/api/agents')).json;
+    const extra = { id: 'local-api', type: 'openai-compatible', baseUrl: 'https://example.invalid/v1', model: 'original-model', apiKeyEnv: keyEnv, apiKey: secret };
+    const saved = await h.call('PUT', '/api/agents', { revision: global.revision, agents: [...global.agents, extra] });
+    assert.equal(saved.status, 200);
+    assert.doesNotMatch(JSON.stringify(saved.json), new RegExp(secret));
+    assert.doesNotMatch(await fs.readFile(saved.json.file, 'utf8'), new RegExp(secret));
+    const pid = h.projectIds[0];
+    const setting = await h.call('GET', `/api/projects/${pid}/settings`);
+    assert.ok(setting.json.agents.some((a: { id: string }) => a.id === 'local-api'));
+    assert.ok(setting.json.agents.some((a: { id: string }) => a.id === 'a'), 'existing project agents remain available');
+
+    const started = await h.call('POST', runsPath(pid), {
+      task: 'use global pool',
+      workflow: { plan: { agent: 'claude', model: 'planner-model' }, implement: { agent: 'local-api', model: '' } },
+    });
+    assert.equal(started.status, 202);
+    const id = started.json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval' && await idle(h, pid), 45000);
+    assert.equal(h.agent.calls.at(-1)?.model, 'planner-model');
+    const changed = await h.call('PUT', '/api/agents', { revision: saved.json.revision, agents: [...global.agents, { ...extra, model: 'changed-model' }] });
+    assert.equal(changed.status, 200);
+    const approved = await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: await planVer(h, pid, id) });
+    assert.equal(approved.status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal(h.agent.calls.find((call) => call.stage === 'implement')?.model, 'original-model');
+    const run = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(run.workflow.implement.agent, 'local-api');
+    assert.equal(run.rounds[0].implement.agent, 'local-api');
+  } finally {
+    delete process.env[keyEnv];
+    await h.close();
+  }
+});
 
 // ---------------------------------------------------------------- tests
 
@@ -629,6 +758,77 @@ test('cleanup shares the repository slot: refused while a replan runs, worktree 
     gate.release();
     await waitFor(() => idle(h, pid));
     assert.equal((await h.call('POST', runsPath(pid, id, '/cleanup'), {})).status, 200);
+  } finally {
+    await h.close();
+  }
+});
+
+// ------------------------------------------------------------------ native sessions through the API
+
+test('sessions: recorded per stage, returned by the detail API and still readable after a server restart', async () => {
+  const repo = await makeRepo();
+  const regFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'rb-home-')), 'projects.json');
+  const h = await harness([repo], { registryFile: regFile });
+  const [pid] = h.projectIds;
+  let id = '';
+  try {
+    const created = await h.call('POST', runsPath(pid), { task: 'make value good' });
+    assert.equal(created.status, 202);
+    id = created.json.id as string;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval');
+    await waitFor(() => idle(h, pid));
+    assert.equal((await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: await planVer(h, pid, id) })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded');
+    const run = (await h.call('GET', runsPath(pid, id))).json.run;
+    const labels = (run.sessions ?? []).map((s: any) => s.label);
+    assert.deepEqual(labels, ['plan', 'implement-r1', 'review-r1', 'release']);
+    for (const s of run.sessions) {
+      assert.equal(s.status, 'completed');
+      assert.equal(typeof s.cwd, 'string');
+    }
+  } finally {
+    await h.close();
+  }
+  // A new server over the same projects reads the same records from disk.
+  const again = await harness([], { registryFile: regFile });
+  try {
+    const [pid2] = again.projectIds;
+    const run = (await again.call('GET', runsPath(pid2, id))).json.run;
+    assert.equal(run.status, 'succeeded');
+    assert.deepEqual((run.sessions ?? []).map((s: any) => s.label), ['plan', 'implement-r1', 'review-r1', 'release']);
+  } finally {
+    await again.close();
+  }
+});
+
+test('sessions: a run saved before sessions were recorded still opens normally', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const [pid] = h.projectIds;
+  try {
+    const dir = path.join(repo, '.repobaton', 'runs', 'old1');
+    await fs.mkdir(dir, { recursive: true });
+    const now = new Date().toISOString();
+    await fs.writeFile(
+      path.join(dir, 'state.json'),
+      JSON.stringify({
+        id: 'old1',
+        task: 'an older task',
+        repo,
+        status: 'failed',
+        createdAt: now,
+        updatedAt: now,
+        rounds: [],
+        publish: {},
+        usage: { costUsd: 0, inputTokens: 0, outputTokens: 0, calls: 0 },
+      }),
+    );
+    const got = await h.call('GET', runsPath(pid, 'old1'));
+    assert.equal(got.status, 200);
+    assert.equal(got.json.run.task, 'an older task');
+    assert.equal(got.json.run.sessions, undefined);
+    const list = await h.call('GET', runsPath(pid));
+    assert.ok(list.json.runs.some((r: any) => r.id === 'old1'));
   } finally {
     await h.close();
   }

@@ -54,6 +54,20 @@ export interface Round {
   decision?: 'approved' | 'changes-requested';
 }
 
+export interface StageSession {
+  label: string;
+  stage: StageName;
+  round?: number;
+  agent: string;
+  agentType: string;
+  sessionId?: string;
+  persisted: boolean;
+  cwd: string;
+  status: 'running' | 'completed' | 'failed';
+  startedAt: string;
+  finishedAt?: string;
+}
+
 export interface Plan {
   summary: string;
   steps: { title: string; detail: string; files: string[] }[];
@@ -64,6 +78,7 @@ export interface Plan {
 
 export interface RunDetail extends Omit<RunRow, 'rounds' | 'executing' | 'hasWorktree' | 'publishInFlight'> {
   rounds: Round[];
+  workflow?: Partial<Record<StageName, { agent: string; model?: string }>>;
   plan?: Plan;
   planVersion?: number;
   planApproved?: boolean;
@@ -71,6 +86,7 @@ export interface RunDetail extends Omit<RunRow, 'rounds' | 'executing' | 'hasWor
   base?: { branch: string; sha: string };
   release?: { version_bump: string; suggested_version: string; pr_title: string; pr_body: string; release_notes: string; risks: string[] };
   publish: { inFlight?: string; pushed?: boolean; prUrl?: string };
+  sessions?: StageSession[];
 }
 
 export interface RunEvent {
@@ -86,6 +102,58 @@ export interface MissingSecret {
   agent: string;
   variable: string;
   stages: string[];
+}
+
+export type StageName = 'plan' | 'implement' | 'review' | 'release';
+export type TaskWorkflow = Partial<Record<StageName, { agent: string; model: string }>>;
+export type GlobalAgentType = 'codex-cli' | 'claude-cli' | 'openai-compatible' | 'anthropic-compatible' | 'command';
+
+export interface CommandOptions {
+  command: string;
+  args: string[];
+  promptVia: 'stdin' | 'arg';
+  output: 'text' | 'json';
+}
+
+export interface GlobalAgent extends Partial<CommandOptions> {
+  id: string;
+  type: GlobalAgentType;
+  path?: string;
+  model?: string;
+  baseUrl?: string;
+  apiKeyEnv?: string;
+}
+
+export interface GlobalAgents {
+  file: string;
+  revision: string;
+  agents: GlobalAgent[];
+}
+
+export interface ProjectSettings {
+  file: string | null;
+  revision: string;
+  agents: Array<{ id: string; type: string }>;
+  commandAgents: Array<CommandOptions & { id: string }>;
+  stages: Array<{ name: StageName; agent: string; model: string; enabled: boolean }>;
+  requireApproval: boolean;
+  testCommand: string | null;
+}
+
+export interface SettingsUpdate {
+  revision: string;
+  stages?: Partial<Record<StageName, { agent?: string; model?: string }>>;
+  requireApproval?: boolean;
+  testCommand?: string | null;
+  commands?: Record<string, CommandOptions>;
+}
+
+export interface AgentConnection {
+  id: string;
+  status: 'logged-in' | 'signed-out' | 'installed' | 'missing' | 'key-present' | 'key-missing' | 'found';
+  version?: string;
+  path?: string;
+  variable?: string;
 }
 
 export class ApiError extends Error {
@@ -140,12 +208,19 @@ const p = (id: string) => `/projects/${encodeURIComponent(id)}`;
 
 export const api = {
   health: () => call<{ ok: boolean; serverId: string }>('GET', '/health'),
+  globalAgents: () => call<GlobalAgents>('GET', '/agents'),
+  saveGlobalAgents: (revision: string, agents: GlobalAgent[]) => call<GlobalAgents>('PUT', '/agents', { revision, agents }),
+  checkGlobalAgents: () => call<{ agents: AgentConnection[] }>('POST', '/agents/check', {}),
+  previewAgentsYaml: (yaml: string) => call<{ agents: GlobalAgent[] }>('POST', '/agents/import', { yaml }),
   projects: () => call<{ projects: Project[] }>('GET', '/projects'),
   addProject: (path: string, name?: string) => call<{ project: Project }>('POST', '/projects', { path, name }),
   removeProject: (id: string) => call<{ ok: boolean }>('DELETE', p(id)),
   status: (id: string) => call<{ project: Project; missingSecrets: MissingSecret[]; configFile: string | null }>('GET', `${p(id)}/status`),
+  settings: (id: string) => call<ProjectSettings>('GET', `${p(id)}/settings`),
+  saveSettings: (id: string, update: SettingsUpdate) => call<ProjectSettings>('PUT', `${p(id)}/settings`, update),
+  checkAgents: (id: string) => call<{ agents: AgentConnection[] }>('POST', `${p(id)}/settings/check`, {}),
   runs: (id: string) => call<{ runs: RunRow[] }>('GET', `${p(id)}/runs`),
-  createRun: (id: string, task: string) => call<{ id: string }>('POST', `${p(id)}/runs`, { task }),
+  createRun: (id: string, task: string, workflow?: TaskWorkflow) => call<{ id: string }>('POST', `${p(id)}/runs`, { task, workflow }),
   run: (id: string, run: string) => call<{ run: RunDetail; executing: boolean }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}`),
   events: (id: string, run: string, after: number) =>
     call<{ events: RunEvent[]; settled: boolean; status: RunStatus }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/events?after=${after}`),

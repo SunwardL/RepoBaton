@@ -3,23 +3,29 @@ import { createRoot } from 'react-dom/client';
 import { api, ApiError, hasToken, initApi, type Project } from './api';
 import { ProjectView } from './ProjectView';
 import { RunView } from './RunView';
+import { SettingsView } from './SettingsView';
+import { GlobalAgentsView } from './GlobalAgentsView';
 import { errorText, useToast } from './common';
 import './styles.css';
 
 initApi();
 
 interface Route {
+  agents?: boolean;
   project?: string;
   run?: string;
+  settings?: boolean;
 }
 
 function parseRoute(): Route {
-  const m = /^#\/p\/([^/]+)(?:\/r\/([^/]+))?/.exec(window.location.hash);
-  return m ? { project: decodeURIComponent(m[1]), run: m[2] ? decodeURIComponent(m[2]) : undefined } : {};
+  if (window.location.hash === '#/agents') return { agents: true };
+  const m = /^#\/p\/([^/]+)(?:\/(settings)|\/r\/([^/]+))?$/.exec(window.location.hash);
+  return m ? { project: decodeURIComponent(m[1]), settings: !!m[2], run: m[3] ? decodeURIComponent(m[3]) : undefined } : {};
 }
 
-export function go(project?: string, run?: string): void {
-  window.location.hash = project ? `#/p/${encodeURIComponent(project)}${run ? `/r/${encodeURIComponent(run)}` : ''}` : '#/';
+export function go(project?: string, route?: 'settings' | { run: string }): void {
+  const suffix = route === 'settings' ? '/settings' : route ? `/r/${encodeURIComponent(route.run)}` : '';
+  window.location.hash = project ? `#/p/${encodeURIComponent(project)}${suffix}` : '#/';
 }
 
 function App() {
@@ -52,8 +58,8 @@ function App() {
 
   // Open the first project when none is chosen yet.
   useEffect(() => {
-    if (projects && projects.length && !route.project) go(projects[0].id);
-  }, [projects, route.project]);
+    if (projects && projects.length && !route.project && !route.agents) go(projects[0].id);
+  }, [projects, route.project, route.agents]);
 
   if (!hasToken() || fatal === 'token') {
     return (
@@ -100,6 +106,8 @@ function App() {
           <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><rect x="9.5" y="1" width="5" height="22" rx="2.5" transform="rotate(35 12 12)" fill="#fff" /><circle cx="18.5" cy="5.5" r="3.2" fill="#6C8CFF" /></svg>
           RepoBaton
         </div>
+        <button className={`pitem global-agents-link ${route.agents ? 'on' : ''}`}
+          aria-current={route.agents ? 'page' : undefined} onClick={() => { window.location.hash = '#/agents'; }}>全局 Agent</button>
         <div>
           <h2>项目</h2>
           <div className="plist">
@@ -126,14 +134,19 @@ function App() {
         </div>
       </aside>
       <main>
-        {projects === null ? (
+        {route.agents ? (
+          <GlobalAgentsView toast={toast.show} />
+        ) : projects === null ? (
           <p className="muted">加载中…</p>
         ) : !current ? (
           <div className="empty"><h2>选择或添加一个项目</h2>在左侧输入一个本地 Git 仓库的路径。同一个仓库的子目录或工作区会被识别为同一个项目。</div>
         ) : route.run ? (
           <RunView key={`${current.id}/${route.run}`} projectId={current.id} runId={route.run} notify={toast.show} onBack={() => go(current.id)} />
+        ) : route.settings ? (
+          <SettingsView key={current.id} project={current} onBack={() => go(current.id)} toast={toast.show} />
         ) : (
-          <ProjectView key={current.id} project={current} onOpenRun={(id) => go(current.id, id)} onChanged={refresh} toast={toast.show} />
+          <ProjectView key={current.id} project={current} onOpenRun={(run) => go(current.id, { run })}
+            onOpenSettings={() => go(current.id, 'settings')} onChanged={refresh} toast={toast.show} />
         )}
       </main>
       {toast.node}

@@ -123,31 +123,38 @@ export interface LoadedConfig {
   config: Config;
   file: string | null;
   warnings: string[];
+  source: string;
 }
 
-export async function loadConfig(repo: string, explicit?: string): Promise<LoadedConfig> {
+export async function loadConfig(repo: string, explicit?: string, shared?: Config['agents']): Promise<LoadedConfig> {
   const file = explicit ? path.resolve(explicit) : await findConfig(repo);
+  let source = '';
   let raw: unknown = {};
   if (file) {
     if (!(await exists(file))) throw new ConfigError([`config file not found: ${file}`]);
     try {
-      raw = YAML.parse(await fs.readFile(file, 'utf8')) ?? {};
+      source = await fs.readFile(file, 'utf8');
+      raw = YAML.parse(source) ?? {};
     } catch (e) {
       throw new ConfigError([`${file}: ${(e as Error).message}`]);
     }
-    if (!isObj(raw)) throw new ConfigError([`${file}: top level must be a mapping`]);
   }
+  return { ...resolveConfig(raw, file ?? 'config', shared), file, source };
+}
+
+export function resolveConfig(raw: unknown, label: string, shared?: Config['agents']): { config: Config; warnings: string[] } {
+  if (!isObj(raw)) throw new ConfigError([`${label}: top level must be a mapping`]);
   const base = defaultConfig();
-  const user = raw as Record<string, unknown>;
   // User-defined agents replace the default pair rather than merging into it, so
   // a config that only defines "writer" does not drag in a dangling "claude".
-  if (isObj(user.agents)) base.agents = {};
-  const config = merge(base, user);
+  if (shared || isObj(raw.agents)) base.agents = {};
+  const config = merge(base, raw);
+  if (shared) config.agents = { ...shared, ...config.agents };
   const { errors, warnings } = splitProblems(validateConfig(config));
   if (errors.length) throw new ConfigError(errors);
   // An inline apiKey is a secret value too: make sure no error text can echo it back.
   for (const a of Object.values(config.agents)) registerSecret(a.apiKey);
-  return { config, file, warnings };
+  return { config, warnings };
 }
 
 export function stageAgentId(cfg: Config, stage: StageName): string {

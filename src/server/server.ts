@@ -6,6 +6,7 @@ import path from 'node:path';
 import { loadConfig, ConfigError } from '../config.ts';
 import { eventsFile, readEvents, SETTLED_STATUSES } from '../events.ts';
 import * as G from '../git.ts';
+import { agentEntries, importAgentYaml, readGlobalAgents, saveGlobalAgents } from '../global-agents.ts';
 import { createLogger, type Logger } from '../log.ts';
 import { redactDeep } from '../redact.ts';
 import { Pipeline, PipelineError } from '../pipeline.ts';
@@ -16,13 +17,17 @@ import { identifyRepo, NotAGitRepoError, type RepoIdentity } from '../repoid.ts'
 import { RunStore } from '../store.ts';
 import type { Config, RunState } from '../types.ts';
 import { exists } from '../util.ts';
+import { readTaskWorkflow, withWorkflow } from '../workflow.ts';
 import { missingSecrets, type MissingSecret } from './secrets.ts';
 import { guard, newToken } from './security.ts';
+import { checkAgents, projectSettings, saveProjectSettings } from './settings.ts';
 import { BusyError, ExecutionSlots } from './slot.ts';
 
 export interface ServerOptions {
   /** Project list file. Defaults to the per-user location. */
   registry?: ProjectRegistry;
+  /** Override the per-user Agent settings file for isolated instances. */
+  agentsFile?: string;
   /** Open these repositories as projects at startup (e.g. the current directory). */
   seedProjects?: string[];
   port?: number;
@@ -132,6 +137,7 @@ interface Loaded {
   identity: RepoIdentity;
   config: Config;
   configFile: string | null;
+  configSource: string;
   store: RunStore;
 }
 
@@ -144,6 +150,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const logFile = path.join(userDataDir(), 'server.log');
   const log = opts.log ?? createLogger({ file: logFile, quiet: true });
   let port = 0;
+  let savingAgents = false;
 
   const owner = { serverId, pid: process.pid, startedAt };
 
@@ -158,14 +165,12 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       if (e instanceof NotAGitRepoError) throw new HttpError(409, 'project-missing', `the folder is no longer a Git repository: ${project.root}`);
       throw e;
     }
-    let loaded;
-    try {
-      loaded = await loadConfig(identity.root);
-    } catch (e) {
-      if (e instanceof ConfigError) throw new HttpError(422, 'bad-config', e.message, { problems: e.problems });
-      throw e;
-    }
-    return { project, identity, config: loaded.config, configFile: loaded.file, store: new RunStore(identity.root) };
+    const shared = (await readGlobalAgents(opts.agentsFile)).agents;
+    const loaded = await loadConfig(identity.root, undefined, shared);
+    return {
+      project, identity, config: loaded.config, configFile: loaded.file, configSource: loaded.source,
+      store: new RunStore(identity.root),
+    };
   }
 
   const makePipeline =
@@ -253,6 +258,33 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
     if (method === 'GET' && a === 'health') return send(res, 200, { ok: true, serverId });
 
+    if (a === 'agents') {
+      if (method === 'GET' && !b) {
+        const current = await readGlobalAgents(opts.agentsFile);
+        return send(res, 200, { ...current, agents: agentEntries(current.agents) });
+      }
+      if (method === 'PUT' && !b) {
+        const body = await readBody(req);
+        if (savingAgents) throw new HttpError(409, 'busy', 'agent settings are already being saved');
+        savingAgents = true;
+        try {
+          const saved = await saveGlobalAgents(opts.agentsFile, body.revision, body.agents);
+          if (!saved) throw new HttpError(409, 'stale-config', 'the global agent settings changed; reload before saving');
+          return send(res, 200, { ...saved, agents: agentEntries(saved.agents) });
+        } finally {
+          savingAgents = false;
+        }
+      }
+      if (method === 'POST' && b === 'check' && !c) {
+        const { agents } = await readGlobalAgents(opts.agentsFile);
+        return send(res, 200, { agents: await checkAgents(process.cwd(), agents) });
+      }
+      if (method === 'POST' && b === 'import' && !c) {
+        const body = await readBody(req);
+        return send(res, 200, { agents: importAgentYaml(body.yaml) });
+      }
+    }
+
     // ---------------------------------------------------------------- projects
     if (a === 'projects' && !b) {
       if (method === 'GET') return send(res, 200, { projects: await Promise.all((await registry.list()).map(projectView)) });
@@ -286,6 +318,22 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         return send(res, 200, { project: await projectView(l.project), missingSecrets: missingSecrets(l.config, l.configFile) satisfies MissingSecret[], configFile: l.configFile });
       }
 
+      if (c === 'settings') {
+        if (method === 'GET' && !d) {
+          return send(res, 200, projectSettings({ config: l.config, file: l.configFile, source: l.configSource }));
+        }
+        if (method === 'PUT' && !d) {
+          const body = await readBody(req);
+          const saved = await slots.run(l.identity.key, 'settings', async () =>
+            saveProjectSettings(l.identity.root, body, (await readGlobalAgents(opts.agentsFile)).agents));
+          if (!saved) throw new HttpError(409, 'stale-config', 'the project configuration changed; reload before saving');
+          return send(res, 200, saved);
+        }
+        if (method === 'POST' && d === 'check' && !e) {
+          return send(res, 200, { agents: await checkAgents(l.identity.root, l.config.agents) });
+        }
+      }
+
       if (c === 'runs' && !d) {
         if (method === 'GET') {
           const runs = await l.store.list();
@@ -295,11 +343,12 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           const body = await readBody(req);
           const task = typeof body.task === 'string' ? body.task.trim() : '';
           if (!task) throw new HttpError(400, 'bad-request', 'task is required');
+          const workflow = readTaskWorkflow(l.config, body.workflow);
           // Refuse up front when a stage's agent has no key: the run would fail at its first call.
-          const missing = missingSecrets(l.config, l.configFile, { onlyUsed: true });
+          const missing = missingSecrets(withWorkflow(l.config, workflow), l.configFile, { onlyUsed: true });
           if (missing.length) throw new HttpError(422, 'missing-secret', describeMissing(missing), { missing });
           if (!(await G.hasCommits(l.identity.root))) throw new HttpError(409, 'no-commits', 'the repository has no commits yet');
-          const id = await launch(l, 'start', (p, setId) => p.start(task, setId));
+          const id = await launch(l, 'start', (p, setId) => p.start(task, setId, workflow));
           return send(res, 202, { id });
         }
       }
@@ -387,9 +436,6 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           const expect = typeof body.expectStatus === 'string' ? body.expectStatus : undefined;
           const more = Number(body.moreRounds ?? 0) || 0;
 
-          const missing = missingSecrets(l.config, l.configFile, { onlyUsed: true });
-          if (missing.length) throw new HttpError(422, 'missing-secret', describeMissing(missing), { missing });
-
           // The slot comes first. Everything after it - re-reading the state, checking it is
           // still the state the user saw - happens while holding it, so a duplicate or stale
           // request cannot start a second execution.
@@ -418,6 +464,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
                 throw new HttpError(409, 'stale-plan', 'the plan changed since you opened it (now version ' + current + '); refresh the page and review it again', { planVersion: current, status: state.status });
               }
             }
+            const missing = missingSecrets(withWorkflow(l.config, state.workflow), l.configFile, { onlyUsed: true });
+            if (missing.length) throw new HttpError(422, 'missing-secret', describeMissing(missing), { missing });
             setId(id);
             if (e === 'approve') return p.resume(id, { approvePlan: true });
             if (e === 'reject') return p.rejectPlan(id, feedback);
@@ -451,6 +499,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     handle(req, res).catch((err: unknown) => {
       if (res.headersSent) return res.end();
       if (err instanceof HttpError) return send(res, err.status, { error: { code: err.code, message: err.message, ...(err.extra ?? {}) } });
+      if (err instanceof ConfigError) return send(res, 422, { error: { code: 'bad-config', message: err.message, problems: err.problems } });
       if (err instanceof BusyError) return send(res, 409, { error: { code: 'busy', message: err.message, runId: err.runId ?? null } });
       if (err instanceof PipelineError) return send(res, 409, { error: { code: 'pipeline', message: err.message } });
       log.error(`unhandled: ${(err as Error).stack ?? err}`); // the logger masks it

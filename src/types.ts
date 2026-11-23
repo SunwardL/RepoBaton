@@ -63,6 +63,8 @@ export interface StageConfig {
   requireApproval?: boolean;
 }
 
+export type TaskWorkflow = Partial<Record<StageName, { agent: string; model?: string }>>;
+
 export interface Config {
   version: 1;
   agents: Record<string, AgentConfig>;
@@ -219,6 +221,29 @@ export interface Round {
   decision?: 'approved' | 'changes-requested';
 }
 
+/**
+ * One call of an agent for one stage. Lets the task page show where a native Codex or Claude Code
+ * session lives and how to continue it. Older runs have none: the page then says the native
+ * session cannot be located instead of guessing.
+ */
+export interface StageSession {
+  /** Matches the artifact label, e.g. "plan", "implement-r2", "review-r1", "release". */
+  label: string;
+  stage: StageName;
+  /** Round number for implement and review; implement retries in the same round share one session. */
+  round?: number;
+  agent: string;
+  agentType: AgentType;
+  /** Only agents that really report a session id have one (third-party APIs do not). */
+  sessionId?: string;
+  /** Whether the agent was asked to keep the session on disk. */
+  persisted: boolean;
+  cwd: string;
+  status: 'running' | 'completed' | 'failed';
+  startedAt: string;
+  finishedAt?: string;
+}
+
 export type RunStatus =
   | 'running'
   | 'awaiting-plan-approval'
@@ -256,6 +281,7 @@ export interface PublishState {
 export interface RunState {
   id: string;
   task: string;
+  workflow?: TaskWorkflow;
   repo: string;
   status: RunStatus;
   stage?: string;
@@ -288,6 +314,8 @@ export interface RunState {
   /** Human feedback on the plan; consumed by the next planning attempt only. */
   planFeedback?: string;
   rounds: Round[];
+  /** Native agent sessions per stage call, in call order. */
+  sessions?: StageSession[];
   release?: ReleaseDraft;
   publish: PublishState;
   usage: { costUsd: number; inputTokens: number; outputTokens: number; calls: number };

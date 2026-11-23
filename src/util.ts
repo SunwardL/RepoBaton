@@ -39,10 +39,10 @@ export async function readJson<T>(p: string): Promise<T> {
  * On Windows, rename onto a file that another process or request has open fails
  * with EPERM/EBUSY/EACCES; that is transient, so retry a few times.
  */
-export async function writeFileAtomic(p: string, content: string): Promise<void> {
+export async function writeFileAtomic(p: string, content: string, mode?: number): Promise<void> {
   await ensureDir(path.dirname(p));
   const tmp = `${p}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  await fs.writeFile(tmp, content, 'utf8');
+  await fs.writeFile(tmp, content, { encoding: 'utf8', mode });
   let lastErr: unknown;
   for (let i = 0; i < 12; i++) {
     try {

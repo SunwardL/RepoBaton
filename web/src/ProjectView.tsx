@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, type MissingSecret, type Project, type RunRow, type RunStatus } from './api';
+import { api, type MissingSecret, type Project, type ProjectSettings, type RunRow, type RunStatus, type TaskWorkflow } from './api';
 import { ago, Banner, ERROR_HINT, errorText, Pill, usePoll } from './common';
 
 type Filter = 'all' | 'attention' | 'running' | 'done' | 'failed';
@@ -12,14 +12,18 @@ const FILTERS: { key: Filter; label: string; test: (r: RunRow) => boolean }[] = 
   { key: 'failed', label: '失败', test: (r) => ['failed', 'cancelled'].includes(r.status) },
 ];
 
+const STAGE_TITLES = { plan: '规划', implement: '实现与返修', review: '审核', release: '发版草稿' };
+
 export function ProjectView({
   project,
   onOpenRun,
+  onOpenSettings,
   onChanged,
   toast,
 }: {
   project: Project;
   onOpenRun: (id: string) => void;
+  onOpenSettings: () => void;
   onChanged: () => void;
   toast: (msg: string, kind?: 'ok' | 'err') => void;
 }) {
@@ -30,6 +34,9 @@ export function ProjectView({
   const [composing, setComposing] = useState(false);
   const [task, setTask] = useState('');
   const [busy, setBusy] = useState(false);
+  const [settings, setSettings] = useState<ProjectSettings | null>(null);
+  const [workflow, setWorkflow] = useState<TaskWorkflow>({});
+  const [composeError, setComposeError] = useState('');
 
   usePoll(
     async () => {
@@ -47,10 +54,10 @@ export function ProjectView({
   );
 
   const create = async (): Promise<void> => {
-    if (!task.trim()) return;
+    if (!task.trim() || !settings || busy) return;
     setBusy(true);
     try {
-      const { id } = await api.createRun(project.id, task.trim());
+      const { id } = await api.createRun(project.id, task.trim(), workflow);
       setTask('');
       setComposing(false);
       onChanged();
@@ -61,6 +68,27 @@ export function ProjectView({
       setBusy(false);
     }
   };
+
+  const openComposer = async (): Promise<void> => {
+    if (composing) {
+      setComposing(false);
+      return;
+    }
+    setComposing(true);
+    setSettings(null);
+    setComposeError('');
+    try {
+      const value = await api.settings(project.id);
+      setWorkflow(Object.fromEntries(value.stages.filter((s) => s.enabled).map((s) => [s.name, { agent: s.agent, model: s.model }])));
+      setSettings(value);
+    } catch (err) {
+      setComposeError(errorText(err));
+    }
+  };
+
+  const codex = settings?.agents.find((a) => a.type === 'codex-cli');
+  const claude = settings?.agents.find((a) => a.type === 'claude-cli');
+  const missingForTask = missing.some((m) => Object.values(workflow).some((selection) => selection.agent === m.agent));
 
   const list = runs ?? [];
   const attention = list.filter((r) => FILTERS[1].test(r));
@@ -78,9 +106,12 @@ export function ProjectView({
           <h1>{project.name}</h1>
           <div className="sub mono">{project.root}</div>
         </div>
-        <button className="btn p" onClick={() => setComposing((v) => !v)} disabled={!project.available}>
-          {composing ? '收起' : '+ 新建任务'}
-        </button>
+        <div className="project-actions">
+          <button className="btn" onClick={onOpenSettings} disabled={!project.available}>配置</button>
+          <button className="btn p" onClick={() => void openComposer()} disabled={!project.available}>
+            {composing ? '收起' : '+ 新建任务'}
+          </button>
+        </div>
       </div>
 
       {!project.available ? (
@@ -141,8 +172,41 @@ export function ProjectView({
             }}
             aria-label="任务描述"
           />
+          <div className="task-workflow settings-form">
+            <div className="settings-agent-head">
+              <h3>本次任务编排</h3>
+              {codex && claude && (
+                <button className="btn sm" type="button" disabled={busy} onClick={() => setWorkflow((current) =>
+                  Object.fromEntries(Object.keys(current).map((name) => [name, { agent: name === 'implement' ? codex.id : claude.id, model: '' }])))}>
+                  使用本机 Codex + Claude Code
+                </button>
+              )}
+            </div>
+            {composeError ? <p role="alert">{composeError}</p> : !settings ? <p className="muted">正在读取 Agent…</p> :
+              settings.stages.filter((stage) => stage.enabled).map((stage) => {
+                const selection = workflow[stage.name];
+                if (!selection) return null;
+                const title = STAGE_TITLES[stage.name];
+                return (
+                  <div className="settings-stage-row" key={stage.name}>
+                    <span className="settings-stage-name">{title}</span>
+                    <label>Agent
+                      <select aria-label={`${title} Agent`} value={selection.agent} disabled={busy}
+                        onChange={(e) => setWorkflow({ ...workflow, [stage.name]: { agent: e.target.value, model: '' } })}>
+                        {settings.agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.id}</option>)}
+                      </select>
+                    </label>
+                    <label>模型
+                      <input aria-label={`${title}模型`} value={selection.model} placeholder="沿用 Agent 默认模型" disabled={busy}
+                        onChange={(e) => setWorkflow({ ...workflow, [stage.name]: { ...selection, model: e.target.value } })} />
+                    </label>
+                  </div>
+                );
+              })}
+            {missingForTask && <p className="muted" role="status">本次选中的 Agent 缺少密钥，请在「全局 Agent」里检查。</p>}
+          </div>
           <div className="actions">
-            <button className="btn p" disabled={busy || !task.trim() || missing.some((m) => m.stages.length > 0)} onClick={() => void create()}>
+            <button className="btn p" disabled={busy || !task.trim() || !settings || missingForTask} onClick={() => void create()}>
               {busy ? '正在创建…' : '开始'}
             </button>
             <button className="btn" onClick={() => setComposing(false)}>
