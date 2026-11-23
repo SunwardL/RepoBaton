@@ -112,12 +112,19 @@ export interface AgentRunRequest {
   /** Keep the session on disk so it can be resumed later. */
   persist?: boolean;
   onProgress?: (line: string) => void;
+  /**
+   * Called as soon as the agent's native session id is known (before the call ends), so the id
+   * survives a failure, cancellation, timeout or a server stop in the middle of the call.
+   */
+  onSession?: (sessionId: string, confirmed?: boolean) => void;
 }
 
 export interface AgentResult {
   text: string;
   structured?: unknown;
   sessionId?: string;
+  /** The executable that ran, so a continue command can use the same one. CLI agents only. */
+  cli?: { path: string; command?: string; prefixArgs?: string[] };
   costUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
@@ -148,11 +155,22 @@ export type AgentErrorKind =
 export class AgentError extends Error {
   retryable: boolean;
   kind: AgentErrorKind;
-  constructor(message: string, retryable = true, kind: AgentErrorKind = 'unknown') {
+  /** The native session id the call had already obtained when it failed, if any. */
+  sessionId?: string;
+  /** The executable that was running, if the call got that far. */
+  cli?: { path: string; command?: string; prefixArgs?: string[] };
+  /**
+   * False when the id was chosen by RepoBaton before the call and the CLI never confirmed it, so the
+   * CLI may not have saved that session (a call stopped very early). Undefined when there is no id.
+   */
+  sessionConfirmed?: boolean;
+  constructor(message: string, retryable = true, kind: AgentErrorKind = 'unknown', sessionId?: string, sessionConfirmed?: boolean) {
     super(redactDiagnostic(message));
     this.name = 'AgentError';
     this.retryable = retryable;
     this.kind = kind;
+    this.sessionId = sessionId;
+    this.sessionConfirmed = sessionConfirmed;
   }
 }
 
@@ -239,7 +257,17 @@ export interface StageSession {
   /** Whether the agent was asked to keep the session on disk. */
   persisted: boolean;
   cwd: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
+  /**
+   * False when the id was assigned before the call and the CLI never confirmed it: a call stopped very
+   * early may have left no session behind, so a continue command could fail. Undefined means confirmed
+   * (or an older record).
+   */
+  sessionConfirmed?: boolean;
+  /** Why there is no session id (the call failed before the agent reported one, or the agent has none). */
+  noSessionReason?: string;
+  /** How the CLI that created this session was launched; older records have none. */
+  cli?: { path: string; command?: string; prefixArgs?: string[] };
   startedAt: string;
   finishedAt?: string;
 }

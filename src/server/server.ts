@@ -17,6 +17,7 @@ import { identifyRepo, NotAGitRepoError, type RepoIdentity } from '../repoid.ts'
 import { RunStore } from '../store.ts';
 import type { Config, RunState } from '../types.ts';
 import { exists } from '../util.ts';
+import { resumeCommand } from '../resume.ts';
 import { readTaskWorkflow, withWorkflow } from '../workflow.ts';
 import { missingSecrets, type MissingSecret } from './secrets.ts';
 import { guard, newToken } from './security.ts';
@@ -360,7 +361,11 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
         if (method === 'GET' && !e) {
           const run = await l.store.load(id);
-          return send(res, 200, { run, executing: slots.isExecuting(id) });
+          // The continue command is built here, once, so the page never re-implements CMD quoting.
+          // An unconfirmed id (chosen by RepoBaton, never acknowledged by the CLI) may not exist: the
+          // page gets the command separately so it can say so instead of presenting it as certain.
+          const sessions = run.sessions?.map((s) => ({ ...s, resumeCommand: resumeCommand(s) }));
+          return send(res, 200, { run: sessions ? { ...run, sessions } : run, executing: slots.isExecuting(id) });
         }
         if (method === 'GET' && e === 'events') {
           const after = Number(url.searchParams.get('after') ?? 0) || 0;

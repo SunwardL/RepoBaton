@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -45,6 +46,12 @@ abstract class CliAgent implements Agent {
     return this.found;
   }
 
+  /** What a continue command needs to run the same CLI again. */
+  protected cliInfo(d: Discovered): { path: string; command?: string; prefixArgs?: string[] } {
+    const unwrapped = d.launch.command !== d.path || d.launch.prefixArgs.length > 0;
+    return unwrapped ? { path: d.path, command: d.launch.command, prefixArgs: d.launch.prefixArgs } : { path: d.path };
+  }
+
   describe(): string {
     return `${this.type}${this.cfg.model ? ` (${this.cfg.model})` : ''}`;
   }
@@ -82,8 +89,18 @@ export class ClaudeCliAgent extends CliAgent {
       const tools = (this.cfg.writeTools ?? DEFAULT_WRITE_TOOLS).join(',');
       args.push('--tools', tools, '--allowedTools', tools, '--permission-mode', 'acceptEdits');
     }
+    // Resuming keeps the id it has. A new persisted session gets an id chosen here, before the call
+    // starts, so a timeout, cancellation or crash still leaves the user an id to continue from.
+    let sessionId: string | undefined = req.sessionId;
     if (req.sessionId) args.push('--resume', req.sessionId);
+    else if (req.persist) {
+      sessionId = randomUUID();
+      args.push('--session-id', sessionId);
+    }
     if (!req.persist) args.push('--no-session-persistence');
+    // Only a resumed session is known to exist; a freshly assigned id is confirmed by the CLI's answer.
+    const confirmed = !!req.sessionId;
+    if (sessionId) req.onSession?.(sessionId, confirmed);
     if (this.cfg.maxBudgetUsd) args.push('--max-budget-usd', String(this.cfg.maxBudgetUsd));
     args.push(...(this.cfg.extraArgs ?? []));
 
@@ -97,8 +114,9 @@ export class ClaudeCliAgent extends CliAgent {
       shell,
       onStderrLine: (l) => req.onProgress?.(stripAnsi(l)),
     });
-    if (r.aborted) throw new AgentError('cancelled', false, 'cancelled');
-    if (r.timedOut) throw new AgentError(`claude timed out after ${Math.round(req.timeoutMs / 1000)}s`, true, 'timeout');
+    if (r.aborted) throw new AgentError('cancelled', false, 'cancelled', sessionId, confirmed);
+    if (r.timedOut) throw new AgentError(`claude timed out after ${Math.round(req.timeoutMs / 1000)}s`, true, 'timeout', sessionId, confirmed);
+    // A process that never started has no session worth pointing at.
     if (r.error) throw new AgentError(`failed to start claude: ${r.error}`, false, 'not-found');
 
     let payload: any;
@@ -111,12 +129,16 @@ export class ClaudeCliAgent extends CliAgent {
     if (!payload) {
       throw new AgentError(
         `claude exited ${r.code} without a JSON result: ${tail(stripAnsi(r.stderr || r.stdout), 600)}`,
+        true,
+        'unknown',
+        sessionId,
+        confirmed,
       );
     }
     if (payload.is_error || (r.code !== 0 && payload.subtype !== 'success')) {
       const msg = typeof payload.result === 'string' ? payload.result : payload.subtype;
       const isAuth = /auth|login|credit|permission|api key|unauthorized|401|403/i.test(String(msg));
-      throw new AgentError(`claude reported an error: ${msg}`, !isAuth, isAuth ? 'auth' : /rate.?limit|429|overloaded/i.test(String(msg)) ? 'rate-limit' : 'unknown');
+      throw new AgentError(`claude reported an error: ${msg}`, !isAuth, isAuth ? 'auth' : /rate.?limit|429|overloaded/i.test(String(msg)) ? 'rate-limit' : 'unknown', payload.session_id ?? sessionId, !!payload.session_id || confirmed);
     }
     const text = typeof payload.result === 'string' ? payload.result : '';
     let structured = payload.structured_output;
@@ -125,13 +147,14 @@ export class ClaudeCliAgent extends CliAgent {
       try {
         structured = extractJson(text);
       } catch {
-        throw new AgentError('claude returned no structured_output for a schema request', true, 'bad-output');
+        throw new AgentError('claude returned no structured_output for a schema request', true, 'bad-output', payload.session_id ?? sessionId, !!payload.session_id || confirmed);
       }
     }
     return {
       text,
       structured,
-      sessionId: payload.session_id,
+      sessionId: payload.session_id ?? sessionId,
+      cli: this.cliInfo(d),
       costUsd: payload.total_cost_usd,
       inputTokens:
         (payload.usage?.input_tokens ?? 0) +
@@ -175,6 +198,8 @@ export class CodexCliAgent extends CliAgent {
 
       const { launch, shell } = toLaunchWithShell(d.launch);
       const events: any[] = [];
+      let threadId: string | undefined = req.sessionId;
+      if (threadId) req.onSession?.(threadId);
       const r = await runLaunch(launch, args, {
         cwd: req.cwd,
         input: req.prompt,
@@ -187,6 +212,10 @@ export class CodexCliAgent extends CliAgent {
           try {
             const ev = JSON.parse(l);
             events.push(ev);
+            if (ev.type === 'thread.started' && typeof ev.thread_id === 'string' && ev.thread_id !== threadId) {
+              threadId = ev.thread_id;
+              req.onSession?.(ev.thread_id);
+            }
             if (ev.type === 'item.completed' && ev.item?.type === 'command_execution') {
               req.onProgress?.(`$ ${String(ev.item.command ?? '').slice(0, 160)}`);
             }
@@ -195,8 +224,8 @@ export class CodexCliAgent extends CliAgent {
           }
         },
       });
-      if (r.aborted) throw new AgentError('cancelled', false, 'cancelled');
-      if (r.timedOut) throw new AgentError(`codex timed out after ${Math.round(req.timeoutMs / 1000)}s`, true, 'timeout');
+      if (r.aborted) throw new AgentError('cancelled', false, 'cancelled', threadId);
+      if (r.timedOut) throw new AgentError(`codex timed out after ${Math.round(req.timeoutMs / 1000)}s`, true, 'timeout', threadId);
       if (r.error) throw new AgentError(`failed to start codex: ${r.error}`, false, 'not-found');
 
       const failed = events.find((e) => e.type === 'turn.failed' || e.type === 'error');
@@ -211,7 +240,7 @@ export class CodexCliAgent extends CliAgent {
           tail(stripAnsi(r.stderr), 600) ??
           `exit ${r.code}`;
         const isAuth = /auth|login|sign in|credit|quota|api key|unauthorized|401|403/i.test(String(reason));
-        throw new AgentError(`codex failed: ${reason}`, !isAuth, isAuth ? 'auth' : /rate.?limit|429/i.test(String(reason)) ? 'rate-limit' : 'unknown');
+        throw new AgentError(`codex failed: ${reason}`, !isAuth, isAuth ? 'auth' : /rate.?limit|429/i.test(String(reason)) ? 'rate-limit' : 'unknown', threadId);
       }
       const text = messages[messages.length - 1] ?? '';
       let structured: unknown;
@@ -219,7 +248,7 @@ export class CodexCliAgent extends CliAgent {
         try {
           structured = extractJson(text);
         } catch {
-          throw new AgentError('codex final message was not valid JSON for a schema request', true, 'bad-output');
+          throw new AgentError('codex final message was not valid JSON for a schema request', true, 'bad-output', threadId);
         }
       }
       const thread = events.find((e) => e.type === 'thread.started');
@@ -227,6 +256,7 @@ export class CodexCliAgent extends CliAgent {
         text,
         structured,
         sessionId: thread?.thread_id ?? req.sessionId,
+        cli: this.cliInfo(d),
         inputTokens: completed.usage?.input_tokens,
         outputTokens: completed.usage?.output_tokens,
         durationMs: r.durationMs,

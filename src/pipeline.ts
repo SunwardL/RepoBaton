@@ -329,6 +329,14 @@ export class Pipeline {
             timeoutMs: (sc.timeoutSec ?? 900) * 1000,
             signal: this.signal,
             sessionId: agentId === sessionAgent ? req.sessionId : undefined,
+            onSession: (id, confirmed = true) => {
+              if (session.sessionId === id) return;
+              session.sessionId = id;
+              session.sessionConfirmed = confirmed;
+              // Fire and forget on purpose: the call must not wait for the disk, but the id must reach it
+              // while the call is still running, so a stop in the middle does not lose it.
+              void this.store.save(state).catch(() => undefined);
+            },
             onProgress: (l) => {
               this.log.detail(l);
               this.events.emit('agent.progress', l.slice(0, 300), { stage, data: { label, agent: agentId } });
@@ -340,7 +348,10 @@ export class Pipeline {
           }
           session.status = 'completed';
           session.finishedAt = nowIso();
-          session.sessionId = res.sessionId;
+          session.sessionId = res.sessionId ?? session.sessionId;
+          if (res.sessionId) session.sessionConfirmed = undefined; // the CLI answered with it: confirmed
+          if (res.cli) session.cli = res.cli;
+          if (!session.sessionId && isNative) session.noSessionReason = 'the agent finished without reporting a session id';
           state.usage.calls++;
           state.usage.costUsd += res.costUsd ?? 0;
           state.usage.inputTokens += res.inputTokens ?? 0;
@@ -356,6 +367,17 @@ export class Pipeline {
           lastErr = e as Error;
           session.status = 'failed';
           session.finishedAt = nowIso();
+          // Keep any id the call had already obtained; say so plainly when there is none.
+          if (e instanceof AgentError && e.sessionId) {
+            session.sessionId = e.sessionId;
+            session.sessionConfirmed = e.sessionConfirmed === false ? false : undefined;
+          }
+          if (!session.sessionId) {
+            session.noSessionReason = isNative
+              ? 'the call ended before the agent reported a session id, so there is no native session to continue'
+              : 'this agent has no native session';
+          }
+          await this.store.save(state).catch(() => undefined);
           if (this.signal?.aborted || lastErr.message === 'cancelled') throw new AgentError('cancelled', false);
           const retryable = !(e instanceof AgentError) || e.retryable;
           this.log.warn(`${stage}/${agentId} failed: ${lastErr.message}`);

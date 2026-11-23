@@ -103,6 +103,15 @@ export async function recoverInterrupted(store: RunStore, opts: RecoveryOptions)
     if (fresh.status !== 'running') continue;
     fresh.status = 'interrupted';
     fresh.interruptedAt = nowIso();
+    // A call that was in flight when the server stopped is over. Close its record (keeping any session
+    // id it had reported) so the page does not show it as running forever.
+    for (const s of fresh.sessions ?? []) {
+      if (s.status !== 'running') continue;
+      s.status = 'interrupted';
+      s.finishedAt = fresh.interruptedAt;
+      if (!s.sessionId) s.noSessionReason = 'the server stopped before the agent reported a session id';
+      // sessionConfirmed stays as recorded: an id the CLI never confirmed is still unconfirmed.
+    }
     fresh.error = `the server that was running this stopped while it was in "${fresh.stage ?? 'progress'}"`;
     // Events first, status second, same order as a normal finish, so followers never miss the last event.
     const sink = await FileEventSink.open(store.dir(fresh.id), fresh.id);

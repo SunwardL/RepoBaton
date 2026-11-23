@@ -63,7 +63,11 @@ export interface StageSession {
   sessionId?: string;
   persisted: boolean;
   cwd: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
+  noSessionReason?: string;
+  sessionConfirmed?: boolean;
+  /** Built by the server from how the CLI was actually launched; null when nothing safe can be offered. */
+  resumeCommand?: string | null;
   startedAt: string;
   finishedAt?: string;
 }

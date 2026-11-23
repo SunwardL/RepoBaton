@@ -833,3 +833,40 @@ test('sessions: a run saved before sessions were recorded still opens normally',
     await h.close();
   }
 });
+
+test('sessions: the detail API builds the continue command from how the CLI was launched, and keeps old records usable', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const [pid] = h.projectIds;
+  try {
+    const dir = path.join(repo, '.repobaton', 'runs', 'cmd1');
+    await fs.mkdir(dir, { recursive: true });
+    const now = new Date().toISOString();
+    const base = { persisted: true, cwd: 'D:\\work space\\wt', startedAt: now, finishedAt: now, status: 'completed' };
+    await fs.writeFile(
+      path.join(dir, 'state.json'),
+      JSON.stringify({
+        id: 'cmd1',
+        task: 't',
+        repo,
+        status: 'failed',
+        createdAt: now,
+        updatedAt: now,
+        rounds: [],
+        publish: {},
+        usage: { costUsd: 0, inputTokens: 0, outputTokens: 0, calls: 0 },
+        sessions: [
+          { ...base, label: 'implement-r1', stage: 'implement', agent: 'codex', agentType: 'codex-cli', sessionId: '01a2079f-2f6f-7041-b8b9-c1620698f68b', cli: { path: 'C:\\Program Files\\Codex\\codex.exe' } },
+          { ...base, label: 'plan', stage: 'plan', agent: 'claude', agentType: 'claude-cli', sessionId: 'b19ca7e5-0ff1-40c4-b003-8c1f1bd93472' },
+          { ...base, label: 'release', stage: 'release', agent: 'api', agentType: 'openai-compatible' },
+        ],
+      }),
+    );
+    const sessions = (await h.call('GET', runsPath(pid, 'cmd1'))).json.run.sessions;
+    assert.equal(sessions[0].resumeCommand, 'cd /d "D:\\work space\\wt" && "C:\\Program Files\\Codex\\codex.exe" resume 01a2079f-2f6f-7041-b8b9-c1620698f68b');
+    assert.equal(sessions[1].resumeCommand, 'cd /d "D:\\work space\\wt" && claude --resume b19ca7e5-0ff1-40c4-b003-8c1f1bd93472', 'an old record keeps the bare name');
+    assert.equal(sessions[2].resumeCommand, null, 'an agent without native sessions gets no command');
+  } finally {
+    await h.close();
+  }
+});

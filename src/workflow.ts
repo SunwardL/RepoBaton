@@ -38,12 +38,17 @@ export function withWorkflow(config: Config, workflow?: TaskWorkflow): Config {
       throw new ConfigError([`${name}: restore the configured agent "${selected.agent}" to continue this task`]);
     }
     const original = stages[name];
+    // The backup belongs to the primary agent it was configured for. Keep it while that agent is
+    // unchanged; once the user swaps the agent, the old backup is dropped (and an agent never backs
+    // itself up).
+    const sameAgent = original.agent === selected.agent;
+    const fallbackAgent = sameAgent && original.fallbackAgent !== selected.agent ? original.fallbackAgent : undefined;
     stages[name] = {
       ...original,
       ...selected,
       model: selected.model,
-      effort: original.agent === selected.agent ? original.effort : undefined,
-      fallbackAgent: undefined,
+      effort: sameAgent ? original.effort : undefined,
+      fallbackAgent,
     };
   }
   return { ...config, stages };
