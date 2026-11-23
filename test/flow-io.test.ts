@@ -117,7 +117,7 @@ test('commandEnv exposes files and exit codes, never raw values', () => {
     RB_TASK_FILE: '/run/task.txt',
     RB_STEP_DESIGN_OUTPUT_FILE: '/run/steps/design/output.txt',
     RB_STEP_TESTS_EXIT_CODE: '3',
-    RB_FILE_4: '/wt/docs/a.md',
+    RB_FILE_1: '/wt/docs/a.md',
   });
 });
 
@@ -137,4 +137,21 @@ test('injection: text full of shell metacharacters reaches the command as data a
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.stdout, nasty);
   await assert.rejects(fs.stat(path.join(dir, 'injected.txt')), 'the injected command must not have run');
+});
+
+test('readWorktreeFile cuts a file inside a multi-byte character without leaving a broken one', async () => {
+  const root = await tmp();
+  await fs.writeFile(path.join(root, 'cn.txt'), '你好世界', 'utf8'); // 12 bytes
+  for (const limit of [4, 5, 7, 8, 10]) {
+    const r = await readWorktreeFile(root, 'cn.txt', { maxBytes: limit });
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.truncated, true, 'limit ' + limit);
+      assert.ok(!r.text.includes('�'), 'no replacement character at limit ' + limit);
+      assert.equal(r.bytes, 12);
+    }
+  }
+  const whole = await readWorktreeFile(root, 'cn.txt', { maxBytes: 12 });
+  assert.equal(whole.ok && whole.text, '你好世界');
+  assert.equal(whole.ok && whole.truncated, false);
 });

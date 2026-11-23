@@ -20,27 +20,50 @@ export interface CommandEnvSource {
 }
 
 /**
+ * `RB_FILE_<n>` counts file references only, starting at 1, in the order they appear in `inputs`.
+ * A task or step reference before a file does not shift the number. Documentation and the editor
+ * hint use this same function so there is one rule.
+ */
+export function commandEnvNames(refs: InputRef[]): string[] {
+  const names: string[] = [];
+  let files = 0;
+  for (const ref of refs) {
+    switch (ref.kind) {
+      case 'task': names.push('RB_TASK_FILE'); break;
+      case 'step-output': names.push(`RB_STEP_${envName(ref.step)}_OUTPUT_FILE`); break;
+      case 'step-exit-code': names.push(`RB_STEP_${envName(ref.step)}_EXIT_CODE`); break;
+      case 'file': names.push(`RB_FILE_${++files}`); break;
+    }
+  }
+  return names;
+}
+
+/**
  * Builds the environment a command step receives. Values are never spliced into the command line:
  * text goes through files (so size is not limited by the environment block) and only paths and
- * exit codes are variables, none of which the shell interprets.
+ * exit codes are variables. The variable VALUES are not interpreted by the engine or the shell, but
+ * a command that expands them inside its own shell text must still quote them (paths may contain
+ * spaces, & or %); that part is the command author's responsibility.
  */
 export function commandEnv(src: CommandEnvSource): Record<string, string> {
   const env: Record<string, string> = {};
+  const names = commandEnvNames(src.refs);
   src.refs.forEach((ref, index) => {
+    const name = names[index];
     switch (ref.kind) {
       case 'task':
-        env.RB_TASK_FILE = src.taskFile;
+        env[name] = src.taskFile;
         break;
       case 'step-output':
-        env[`RB_STEP_${envName(ref.step)}_OUTPUT_FILE`] = src.outputFile(ref.step);
+        env[name] = src.outputFile(ref.step);
         break;
       case 'step-exit-code': {
         const code = src.exitCode(ref.step);
-        if (code !== undefined) env[`RB_STEP_${envName(ref.step)}_EXIT_CODE`] = String(code);
+        if (code !== undefined) env[name] = String(code);
         break;
       }
       case 'file':
-        env[`RB_FILE_${index + 1}`] = src.resolvedFile(ref.path);
+        env[name] = src.resolvedFile(ref.path);
         break;
     }
   });
@@ -91,7 +114,18 @@ export async function readWorktreeFile(root: string, relative: string, opts: { m
     const { bytesRead } = await handle.read(buf, 0, take, 0);
     const head = buf.subarray(0, bytesRead);
     if (head.includes(0)) return { ok: false, reason: `${relative} 看起来是二进制文件，不能作为文本引用` };
-    return { ok: true, text: head.toString('utf8'), bytes: size, truncated: size > opts.maxBytes, realPath: real };
+    // A cut in the middle of a multi-byte character would decode to U+FFFD; drop the partial tail.
+    let end = head.length;
+    if (size > opts.maxBytes) {
+      let back = end;
+      while (back > 0 && end - back < 4 && (head[back - 1] & 0xc0) === 0x80) back--;
+      if (back > 0) {
+        const lead = head[back - 1];
+        const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+        if (end - (back - 1) < need) end = back - 1;
+      }
+    }
+    return { ok: true, text: head.subarray(0, end).toString('utf8'), bytes: size, truncated: size > opts.maxBytes, realPath: real };
   } finally {
     await handle.close();
   }
