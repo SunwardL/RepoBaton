@@ -40,14 +40,14 @@ export interface BoundedView {
 }
 
 /** Head and tail halves with a marker in between; never silent, never splits a character. */
-export function boundedView(text: string, maxBytes: number, where: string): BoundedView {
+export function boundedView(text: string, maxBytes: number, where: string | undefined): BoundedView {
   const originalBytes = Buffer.byteLength(text);
   if (originalBytes <= maxBytes) return { text, truncated: false, originalBytes };
   const half = Math.floor(maxBytes / 2);
   const head = cutUtf8(text, half).text;
   const tail = tailUtf8(text, half);
   const omitted = originalBytes - Buffer.byteLength(head) - Buffer.byteLength(tail);
-  const marker = `\n[…省略 ${omitted} 字节，完整内容见 ${where}…]\n`;
+  const marker = `\n[…省略 ${omitted} 字节，${where ? `完整内容见 ${where}` : '完整内容未保存'}…]\n`;
   return { text: head + marker + tail, truncated: true, originalBytes };
 }
 
@@ -56,6 +56,8 @@ export interface StepOutput {
   text: string;
   truncated: boolean;
   originalBytes: number;
+  /** True when the stored copy itself was cut, so the full output exists nowhere on disk. */
+  storedTruncated?: boolean;
   /** Where the full output is stored, shown in the truncation note. */
   path: string;
 }
@@ -110,7 +112,9 @@ export function renderPrompt(template: string, src: RenderSources): RenderResult
       if (!o) return { ok: false, reason: `缺少 ${key}（步骤 ${ref.step} 没有产出）` };
       if (o.status !== 'succeeded') return { ok: false, reason: `缺少 ${key}（步骤 ${ref.step} 状态为 ${o.status}）` };
       if (o.truncated) truncated.push(key);
-      const note = o.truncated ? `【已截断：原始 ${o.originalBytes} 字节，只显示部分，完整内容见 ${o.path}】` : undefined;
+      const note = o.storedTruncated
+        ? `【已截断：原始 ${o.originalBytes} 字节，完整内容未保存，只保存了开头部分】`
+        : o.truncated ? `【已截断：原始 ${o.originalBytes} 字节，只显示部分，完整内容见 ${o.path}】` : undefined;
       out += block(`步骤 ${ref.step} 的输出`, o.text, note);
     } else {
       const f = src.files.get(ref.path);

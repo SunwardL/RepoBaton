@@ -101,12 +101,24 @@ export async function readStepOutput(runDir: string, stepId: string, opts: ReadO
   }
   if (createHash('sha256').update(stored).digest('hex') !== meta.sha256) return empty('corrupt');
   const limit = Math.min(opts.maxInjectBytes ?? MAX_INJECT_DEFAULT, MAX_INJECT_HARD);
-  const view = boundedView(stored, limit, rel);
+  // When the stored copy is already partial, the marker must not claim the full text is in the file.
+  const view = boundedView(stored, limit, meta.storedTruncated ? undefined : rel);
   return {
     status: 'succeeded',
     text: view.text,
     truncated: view.truncated || meta.storedTruncated,
+    storedTruncated: meta.storedTruncated,
     originalBytes: meta.originalBytes,
     path: rel,
   };
+}
+
+/**
+ * The only way a command step gets the path of an earlier output: the status and the checksum are
+ * checked first, exactly as for prompt injection. `commandEnv` only assembles paths and does not check.
+ */
+export async function stepOutputFile(runDir: string, stepId: string): Promise<{ ok: true; file: string } | { ok: false; reason: string }> {
+  const o = await readStepOutput(runDir, stepId);
+  if (o.status !== 'succeeded') return { ok: false, reason: `步骤 ${stepId} 没有可用输出（状态：${o.status}）` };
+  return { ok: true, file: path.join(stepDir(runDir, stepId), 'output.txt') };
 }

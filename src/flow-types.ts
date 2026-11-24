@@ -8,6 +8,10 @@ export const STEP_ID_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 export type FlowKind = 'builtin:four-stage' | 'custom';
 export type StepType = 'agent' | 'command' | 'approval' | 'commit';
 
+/** One vocabulary for step state, shared by the store and the executor. Finished successfully is `succeeded`. */
+export const STEP_STATUSES = ['pending', 'running', 'succeeded', 'failed', 'unknown', 'skipped'] as const;
+export type StepStatus = (typeof STEP_STATUSES)[number];
+
 /** A parsed `{{ }}` reference. Only these four forms exist; anything else is a validation error. */
 export type InputRef =
   | { kind: 'task' }
