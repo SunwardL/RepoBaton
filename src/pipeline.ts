@@ -1,6 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { AgentRegistry } from './agents/registry.ts';
+import { defaultConfig } from './config.ts';
 import { detectProject } from './detect.ts';
 import * as G from './git.ts';
 import { FileEventSink, noopSink, type EventSink } from './events.ts';
@@ -26,8 +28,15 @@ import {
 } from './types.ts';
 import { formatFeedback, judge } from './verdict.ts';
 import { withWorkflow } from './workflow.ts';
+import { requestsPublish, validateWorkflow, workflowHash } from './flow.ts';
+import { executeFlow, flowApprovalPreview } from './flow-executor.ts';
+import { writeStepOutput } from './flow-store.ts';
+import type { Workflow } from './flow-types.ts';
+import { identifyProject } from './repoid.ts';
+import { cleanupRun } from './recovery.ts';
+import { fingerprintRemoteAddress, restoreFlowAgents, snapshotFlowAgents } from './flow-config.ts';
 import { redactDeep, redactDiagnostic } from './redact.ts';
-import { ensureDir, nowIso, sleep, slugify, tail, truncate, validateSchema, readJson, exists } from './util.ts';
+import { nowIso, sleep, slugify, tail, truncate, validateSchema, readJson, exists } from './util.ts';
 
 export class PipelineError extends Error {
   status: RunState['status'];
@@ -94,7 +103,56 @@ export class Pipeline {
 
   // ------------------------------------------------------------------ entry points
 
+  private async restoredFlowAgents(snapshot: NonNullable<NonNullable<RunState['flow']>['agents']>): Promise<Config['agents']> {
+    try { return await restoreFlowAgents(snapshot, this.baseConfig); }
+    catch (error) { throw new PipelineError((error as Error).message, 'needs-human'); }
+  }
+
   /** onCreated fires as soon as the run exists, so a caller can show it before the (long) execution ends. */
+  async startFlow(task: string, workflow: Workflow, onCreated?: (id: string) => void, expectedWorkspaceMode?: 'worktree' | 'directory', confirmationHash?: string): Promise<RunState> {
+    const problems = validateWorkflow(workflow, { hasAgent: (id) => Object.hasOwn(this.baseConfig.agents, id) }).filter((issue) => issue.level === 'error');
+    if (problems.length) throw new PipelineError(problems.map((issue) => issue.message).join('; '));
+    if (workflow.kind !== 'custom') throw new PipelineError('expected a custom workflow');
+    if (!task.trim()) throw new PipelineError('task description is empty');
+    const identity = await identifyProject(this.repo);
+    const hasCommits = identity.isGit && await G.hasCommits(this.repo);
+    if (expectedWorkspaceMode && expectedWorkspaceMode !== (hasCommits ? 'worktree' : 'directory')) throw new PipelineError('workspace changed since the start preview; review it again');
+    if (!hasCommits && workflow.steps.some((step) => step.type === 'commit')) throw new PipelineError('Git commit steps require a repository with an initial commit');
+    if (!hasCommits && workflow.git.mode === 'agent-managed') throw new PipelineError('agent-managed Git needs a repository with an initial commit');
+    if (workflow.git.publish?.tag) {
+      const tag = `${workflow.git.publish.tagPrefix ?? 'v'}${workflow.git.release?.version ?? ''}`;
+      try { await G.git(this.repo, ['check-ref-format', `refs/tags/${tag}`]); }
+      catch { throw new PipelineError('the tag prefix and version do not form a valid Git tag'); }
+    }
+    const snapshot = structuredClone(workflow);
+    if (workflowHash(redactDeep(snapshot, { assignments: true })) !== workflowHash(snapshot)) {
+      throw new PipelineError('the workflow contains sensitive values; use environment variables');
+    }
+    const agents = await snapshotFlowAgents(snapshot, this.baseConfig);
+    const publishConfig = requestsPublish(snapshot.git) ? { ...defaultConfig().publish, ...snapshot.git.publish } : undefined;
+    if (publishConfig) this.cfg = { ...this.baseConfig, publish: publishConfig };
+    const id = newRunId();
+    const state: RunState = {
+      id, task: task.trim(), repo: this.repo, status: 'running', createdAt: nowIso(), updatedAt: nowIso(),
+      rounds: [], publish: {}, usage: { costUsd: 0, inputTokens: 0, outputTokens: 0, calls: 0 }, owner: this.opts.owner,
+      workspaceMode: hasCommits ? 'worktree' : 'directory',
+      flow: { schema: 1, kind: 'custom', name: snapshot.name, workflow: snapshot, hash: workflowHash(snapshot), agents, ...(publishConfig ? { publishConfig } : {}),
+        ...(confirmationHash ? { startConfirmation: { hash: confirmationHash, at: nowIso() } } : {}) },
+      steps: Object.fromEntries(snapshot.steps.map((step) => [step.id, { status: 'pending', attempt: 0 }])),
+    };
+    if (publishConfig) {
+      const draft = snapshot.git.release;
+      state.release = { version_bump: 'none', suggested_version: draft?.version ?? '',
+        pr_title: draft?.title?.trim() || task.trim().split('\n')[0].slice(0, 70), pr_body: draft?.body?.trim() ? draft.body : task.trim(),
+        release_notes: draft?.notes ?? '', risks: [] };
+    }
+    await this.store.save(state);
+    await this.openEvents(state);
+    this.events.emit('run.started', task.slice(0, 120).replace(/\s+/g, ' '), { data: { task } });
+    onCreated?.(id);
+    return this.execute(state);
+  }
+
   async start(task: string, onCreated?: (id: string) => void, workflow?: RunState['workflow']): Promise<RunState> {
     this.cfg = withWorkflow(this.baseConfig, workflow);
     task = task.trim();
@@ -127,11 +185,22 @@ export class Pipeline {
   async resume(idOrPrefix: string, ropts: ResumeOptions = {}): Promise<RunState> {
     const id = await this.store.resolve(idOrPrefix);
     const state = await this.store.load(id);
+    if (state.humanControl) throw new PipelineError('this task is under human control; return it before continuing', 'needs-human');
+    if (state.handoff?.reviewRequired) throw new PipelineError('the human changes need a clean commit and review before continuing', 'needs-human');
+    if (!state.flow && !state.publish.merged && state.branch && state.worktree && await exists(state.worktree) && await G.currentBranch(state.worktree) !== state.branch) {
+      throw new PipelineError(`the worktree is no longer on ${state.branch}; restore the task branch before continuing`, 'needs-human');
+    }
     if (state.status === 'succeeded') {
       this.log.info('run already succeeded; nothing to do');
       return state;
     }
-    this.cfg = withWorkflow(this.baseConfig, state.workflow);
+    if (state.flow) {
+      if (!state.flow.agents) throw new PipelineError('this custom workflow has no agent snapshot; restore it manually', 'needs-human');
+      if (requestsPublish(state.flow.workflow.git) && !state.flow.publishConfig) throw new PipelineError('this workflow has no saved publish configuration', 'needs-human');
+      this.cfg = { ...this.baseConfig, agents: await this.restoredFlowAgents(state.flow.agents),
+        ...(state.flow.publishConfig ? { publish: state.flow.publishConfig } : {}) };
+      if (!this.opts.registry) this.registry = new AgentRegistry(this.cfg);
+    } else this.cfg = withWorkflow(this.baseConfig, state.workflow);
     if (state.status === 'awaiting-plan-approval' && !ropts.approvePlan && !ropts.feedback && !this.opts.approvePlan) {
       throw new PipelineError('this run is waiting for plan approval: use "repobaton approve <run>"', 'awaiting-plan-approval');
     }
@@ -158,6 +227,221 @@ export class Pipeline {
     return this.execute(state);
   }
 
+  /** Approve the exact custom-step content that the user saw. */
+  async approveFlow(idOrPrefix: string, stepId: string, expectedHash: string, onApproved?: (id: string) => void): Promise<RunState> {
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    if (state.humanControl) throw new PipelineError('this task is under human control; return it before continuing', 'needs-human');
+    const step = state.flow?.workflow.steps.find((item) => item.id === stepId);
+    const checkpoint = state.steps?.[stepId];
+    if (state.status !== 'needs-human' || step?.type !== 'approval' || checkpoint?.status !== 'pending' || !checkpoint.approvalPreview) {
+      throw new PipelineError('this step is no longer waiting for approval', 'needs-human');
+    }
+    if (!state.flow?.agents) throw new PipelineError('this custom workflow has no agent snapshot; restore it manually', 'needs-human');
+    await this.restoredFlowAgents(state.flow.agents);
+    const previous = state.flow!.workflow.steps.slice(0, state.flow!.workflow.steps.indexOf(step));
+    if (previous.some((item) => state.steps?.[item.id]?.status !== 'succeeded')) throw new PipelineError('an earlier step is incomplete', 'needs-human');
+    let current: Awaited<ReturnType<typeof flowApprovalPreview>>;
+    try { current = await flowApprovalPreview(state, this.store, step, this.ops); }
+    catch (error) { throw new PipelineError(`cannot recheck approval: ${(error as Error).message}`, 'needs-human'); }
+    if (expectedHash !== checkpoint.approvalPreview.contentHash || expectedHash !== current.contentHash) {
+      checkpoint.approvalPreview = current;
+      await this.store.save(state);
+      throw new PipelineError('approval content changed; review it again', 'needs-human');
+    }
+    checkpoint.approval = { by: 'user', at: nowIso(), contentHash: expectedHash,
+      ...(current.approvedHead ? { approvedHead: current.approvedHead, approvedBranch: current.approvedBranch, approvedDraftHash: current.approvedDraftHash, approvedTarget: current.approvedTarget } : {}) };
+    checkpoint.status = 'succeeded';
+    checkpoint.finishedAt = nowIso();
+    delete checkpoint.approvalPreview;
+    await this.store.save(state);
+    onApproved?.(id);
+    return this.resume(id);
+  }
+
+  /** Reopen publication confirmation only before any remote operation has started. */
+  async reviewPublicationAgain(idOrPrefix: string, expectedHash: string): Promise<void> {
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    if (state.humanControl || state.status === 'running' || state.status === 'succeeded') throw new PipelineError('the task cannot be reviewed in its current state', 'needs-human');
+    if (!state.flow || !requestsPublish(state.flow.workflow.git)) throw new PipelineError('this task has no publication to review', 'needs-human');
+    const last = state.flow.workflow.steps.at(-1);
+    const checkpoint = last ? state.steps?.[last.id] : undefined;
+    if (last?.type !== 'approval' || checkpoint?.status !== 'succeeded' || checkpoint.approval?.contentHash !== expectedHash) {
+      throw new PipelineError('the publication confirmation changed; refresh the task', 'needs-human');
+    }
+    const p = state.publish;
+    if (p.inFlight || p.pushed || p.prUrl || p.merged || p.tag || p.tagPushed || p.pendingTag) {
+      throw new PipelineError('a remote operation already started; check or restore its original destination instead', 'needs-human');
+    }
+    let preview: Awaited<ReturnType<typeof flowApprovalPreview>>;
+    const previewState = structuredClone(state);
+    delete previewState.steps![last.id].approval;
+    try { preview = await flowApprovalPreview(previewState, this.store, last, this.ops); }
+    catch (error) { throw new PipelineError(`cannot prepare publication review: ${(error as Error).message}`, 'needs-human'); }
+    checkpoint.status = 'pending';
+    checkpoint.approvalPreview = preview;
+    delete checkpoint.approval;
+    delete checkpoint.finishedAt;
+    state.status = 'needs-human';
+    state.error = undefined;
+    await this.store.save(state);
+  }
+
+  /** Retry only the first unresolved step after the user explicitly asks to repeat it. */
+  async retryFlow(idOrPrefix: string, stepId: string, expectedStatus: string, onAccepted?: (id: string) => void): Promise<RunState> {
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    if (state.humanControl) throw new PipelineError('this task is under human control; return it before continuing', 'needs-human');
+    if (!state.flow?.agents || !state.steps || state.status === 'running' || state.status === 'succeeded') {
+      throw new PipelineError('this custom workflow cannot be retried in its current state', 'needs-human');
+    }
+    await this.restoredFlowAgents(state.flow.agents);
+    const first = state.flow.workflow.steps.find((step) => state.steps?.[step.id]?.status !== 'succeeded');
+    const checkpoint = state.steps[stepId];
+    if (!first || first.id !== stepId || !checkpoint || checkpoint.status !== expectedStatus || !['failed', 'unknown'].includes(checkpoint.status)) {
+      throw new PipelineError('step status changed; reload before retrying', 'needs-human');
+    }
+    if (first.type === 'commit' && checkpoint.status === 'unknown') {
+      if (!state.worktree || !(await exists(state.worktree)) || !checkpoint.headBefore || !checkpoint.expectedTree) {
+        throw new PipelineError('cannot verify the interrupted commit; inspect the worktree before retrying', 'needs-human');
+      }
+      const busy = await G.unfinishedGitOperation(state.worktree);
+      if (busy) throw new PipelineError(`Git has an unfinished operation or index lock (${busy}); inspect the worktree before retrying`, 'needs-human');
+      const head = await G.headSha(state.worktree);
+      const branch = await G.currentBranch(state.worktree);
+      const index = (await G.git(state.worktree, ['write-tree'])).trim();
+      const unstaged = await G.git(state.worktree, ['diff', '--name-only']);
+      const untracked = await G.git(state.worktree, ['ls-files', '--others', '--exclude-standard']);
+      if (head !== checkpoint.headBefore || !state.branch || branch !== state.branch || index !== checkpoint.expectedTree || unstaged.trim() || untracked.trim()) {
+        throw new PipelineError('the interrupted commit cannot be safely retried; inspect HEAD, branch, index and worktree', 'needs-human');
+      }
+    }
+    checkpoint.status = 'pending';
+    delete checkpoint.reason;
+    delete checkpoint.finishedAt;
+    await this.store.save(state);
+    onAccepted?.(id);
+    return this.resume(id);
+  }
+
+  /** Recheck an interrupted commit without performing another Git write. */
+  async recheckUnknownCommit(idOrPrefix: string, stepId: string, attempt: number, onAccepted?: (id: string) => void): Promise<RunState> {
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    if (state.humanControl || state.handoff?.reviewRequired || !state.flow?.agents || !state.steps || state.status === 'running' || state.status === 'succeeded') {
+      throw new PipelineError('this workflow cannot be checked in its current state', 'needs-human');
+    }
+    const first = state.flow.workflow.steps.find((step) => state.steps?.[step.id]?.status !== 'succeeded');
+    const checkpoint = state.steps[stepId];
+    if (!first || first.id !== stepId || first.type !== 'commit' || checkpoint?.status !== 'unknown' || checkpoint.attempt !== attempt) {
+      throw new PipelineError('step status changed; reload before checking', 'needs-human');
+    }
+    if (!state.worktree || !(await exists(state.worktree)) || !state.branch || !checkpoint.headBefore || !checkpoint.expectedTree || !/^[0-9a-f]{40,64}$/i.test(checkpoint.expectedTree) || workflowHash(state.flow.workflow) !== state.flow.hash) {
+      throw new PipelineError('the workspace or commit record is unavailable; inspect it manually', 'needs-human');
+    }
+    const busy = await G.unfinishedGitOperation(state.worktree);
+    if (busy) throw new PipelineError(`Git has an unfinished operation or index lock (${busy}); inspect the worktree`, 'needs-human');
+    const head = await G.headSha(state.worktree);
+    const branch = await G.currentBranch(state.worktree);
+    const parent = (await G.git(state.worktree, ['rev-parse', 'HEAD^'])).trim();
+    const tree = (await G.git(state.worktree, ['rev-parse', 'HEAD^{tree}'])).trim();
+    const index = (await G.git(state.worktree, ['write-tree'])).trim();
+    const status = await G.git(state.worktree, ['status', '--porcelain', '--untracked-files=all']);
+    if (branch !== state.branch || head === checkpoint.headBefore || parent !== checkpoint.headBefore || tree !== checkpoint.expectedTree || index !== checkpoint.expectedTree || status.trim()) {
+      throw new PipelineError('commit evidence does not match or the worktree is not clean; inspect HEAD, branch, index and worktree', 'needs-human');
+    }
+    await this.restoredFlowAgents(state.flow.agents);
+    checkpoint.status = 'succeeded';
+    checkpoint.headAfter = head;
+    checkpoint.finishedAt = nowIso();
+    delete checkpoint.reason;
+    await this.store.save(state);
+    onAccepted?.(id);
+    return this.resume(id);
+  }
+
+  /** Show the actual commit and its difference from the staged tree for explicit review. */
+  async previewChangedCommit(idOrPrefix: string, stepId: string, attempt: number): Promise<{ head: string; expectedTree: string; actualTree: string; diff: string; truncated: boolean; hash: string }> {
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    const step = state.flow?.workflow.steps.find((item) => state.steps?.[item.id]?.status !== 'succeeded');
+    const checkpoint = state.steps?.[stepId];
+    if (state.humanControl || state.handoff?.reviewRequired || state.status === 'running' || state.status === 'succeeded' || !state.flow?.agents || !state.steps ||
+        !step || step.id !== stepId || step.type !== 'commit' || checkpoint?.status !== 'unknown' || checkpoint.attempt !== attempt) {
+      throw new PipelineError('step status changed; reload before checking', 'needs-human');
+    }
+    if (!state.worktree || !(await exists(state.worktree)) || !state.branch || !checkpoint.headBefore || !checkpoint.expectedTree || !/^[0-9a-f]{40,64}$/i.test(checkpoint.expectedTree) || workflowHash(state.flow.workflow) !== state.flow.hash) {
+      throw new PipelineError('the workspace or commit record is unavailable; inspect it manually', 'needs-human');
+    }
+    const busy = await G.unfinishedGitOperation(state.worktree);
+    if (busy) throw new PipelineError(`Git has an unfinished operation or index lock (${busy}); inspect the worktree`, 'needs-human');
+    const head = await G.headSha(state.worktree);
+    const branch = await G.currentBranch(state.worktree);
+    const parent = (await G.git(state.worktree, ['rev-parse', 'HEAD^'])).trim();
+    const tree = (await G.git(state.worktree, ['rev-parse', 'HEAD^{tree}'])).trim();
+    const index = (await G.git(state.worktree, ['write-tree'])).trim();
+    const status = await G.git(state.worktree, ['status', '--porcelain', '--untracked-files=all']);
+    if (branch !== state.branch || head === checkpoint.headBefore || parent !== checkpoint.headBefore || index !== tree || status.trim()) {
+      throw new PipelineError('the branch, parent or worktree does not match; inspect it before accepting the commit', 'needs-human');
+    }
+    if (tree === checkpoint.expectedTree) throw new PipelineError('the commit matches the original tree; use recheck instead', 'needs-human');
+    const diff = await G.git(state.worktree, ['diff', '--no-ext-diff', '--no-color', '--no-renames', checkpoint.expectedTree, tree]);
+    const hash = createHash('sha256').update(JSON.stringify({ id, stepId, attempt, head, branch, parent, expectedTree: checkpoint.expectedTree, tree })).digest('hex');
+    return { head, expectedTree: checkpoint.expectedTree, actualTree: tree, diff: diff.slice(0, 100_000), truncated: diff.length > 100_000, hash };
+  }
+
+  /** Accept exactly the changed commit the user reviewed, without issuing another commit. */
+  async acceptChangedCommit(idOrPrefix: string, stepId: string, attempt: number, expectedHash: string, onAccepted?: (id: string) => void): Promise<RunState> {
+    const preview = await this.previewChangedCommit(idOrPrefix, stepId, attempt);
+    if (preview.hash !== expectedHash) throw new PipelineError('commit evidence changed; review it again', 'needs-human');
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    await this.restoredFlowAgents(state.flow!.agents!);
+    const checkpoint = state.steps![stepId];
+    checkpoint.status = 'succeeded';
+    checkpoint.headAfter = preview.head;
+    checkpoint.finishedAt = nowIso();
+    checkpoint.manualCompletion = { by: 'user', at: checkpoint.finishedAt };
+    delete checkpoint.reason;
+    await this.store.save(state);
+    onAccepted?.(id);
+    return this.resume(id);
+  }
+
+  /** Record the user's verified result without replaying an interrupted operation. */
+  async completeUnknownFlow(idOrPrefix: string, stepId: string, attempt: number, output: string, exitCode: number | undefined, onAccepted?: (id: string) => void): Promise<RunState> {
+    const id = await this.store.resolve(idOrPrefix);
+    const state = await this.store.load(id);
+    if (state.humanControl || state.handoff?.reviewRequired || !state.flow?.agents || !state.steps || state.status === 'running' || state.status === 'succeeded') {
+      throw new PipelineError('this workflow cannot be confirmed in its current state', 'needs-human');
+    }
+    if (!state.worktree || !(await exists(state.worktree)) || workflowHash(state.flow.workflow) !== state.flow.hash) {
+      throw new PipelineError('the workspace or workflow snapshot is unavailable', 'needs-human');
+    }
+    const step = state.flow.workflow.steps.find((item) => state.steps?.[item.id]?.status !== 'succeeded');
+    const checkpoint = state.steps[stepId];
+    if (!step || step.id !== stepId || !['agent', 'command'].includes(step.type) || checkpoint?.status !== 'unknown' || checkpoint.attempt !== attempt) {
+      throw new PipelineError('step status changed; reload before confirming', 'needs-human');
+    }
+    if (Buffer.byteLength(output) > 256 * 1024 || (step.type === 'command' && (!Number.isSafeInteger(exitCode) || exitCode! < -2147483648 || exitCode! > 4294967295))) {
+      throw new PipelineError('provide an output under 256 KB and a valid command exit code', 'needs-human');
+    }
+    await this.restoredFlowAgents(state.flow.agents);
+    const at = nowIso();
+    const { meta } = await writeStepOutput(this.store.dir(id), stepId, output, { status: 'succeeded', startedAt: checkpoint.startedAt ?? at, finishedAt: at,
+      agent: checkpoint.agent, sessionId: checkpoint.sessionId, exitCode: step.type === 'command' ? exitCode : undefined });
+    checkpoint.outputRef = { bytes: meta.storedBytes, sha256: meta.sha256, truncated: meta.storedTruncated, storedTruncated: meta.storedTruncated };
+    checkpoint.status = 'succeeded';
+    checkpoint.finishedAt = at;
+    checkpoint.manualCompletion = { by: 'user', at };
+    if (step.type === 'command') checkpoint.exitCode = exitCode;
+    delete checkpoint.reason;
+    await this.store.save(state);
+    onAccepted?.(id);
+    return this.resume(id);
+  }
+
   /** Each run owns <run>/events.jsonl; logs are mirrored into it. */
   private async openEvents(state: RunState): Promise<void> {
     this.events = await FileEventSink.open(this.store.dir(state.id), state.id);
@@ -179,6 +463,33 @@ export class Pipeline {
   private async execute(state: RunState): Promise<RunState> {
     try {
       await this.prepare(state);
+      if (state.flow?.kind === 'custom') {
+        await executeFlow(state, this.store, this.registry, this.signal, this.events, this.ops);
+        if (state.status === 'succeeded' && requestsPublish(state.flow.workflow.git)) {
+          // The steps are complete, but the run is not settled while remote work is in progress.
+          // In-flight markers must be persisted with `running` so restart recovery can find them.
+          state.status = 'running';
+          const last = state.flow.workflow.steps.at(-1);
+          const approval = last ? state.steps?.[last.id]?.approval : undefined;
+          if (!approval?.approvedHead || !approval.approvedBranch || !approval.approvedDraftHash || !approval.approvedTarget) throw new PipelineError('publication has not been approved for an exact commit and target', 'needs-human');
+          if (approval.approvedBranch !== state.branch) throw new PipelineError('the approved branch changed; review publication again', 'needs-human');
+          if (!last || last.type !== 'approval') throw new PipelineError('publication confirmation is missing', 'needs-human');
+          const started = !!(state.publish.inFlight || state.publish.pushed || state.publish.prUrl || state.publish.merged || state.publish.tag || state.publish.pendingTag);
+          if (!started) {
+            let current: Awaited<ReturnType<typeof flowApprovalPreview>>;
+            try { current = await flowApprovalPreview(state, this.store, last, this.ops); }
+            catch (error) { throw new PipelineError(`cannot recheck publication: ${(error as Error).message}`, 'needs-human'); }
+            if (current.contentHash !== approval.contentHash) throw new PipelineError('the approved publication content changed; publication is paused', 'needs-human');
+          }
+          if (!state.release || createHash('sha256').update(JSON.stringify(redactDeep(state.release, { assignments: true }))).digest('hex') !== approval.approvedDraftHash) {
+            throw new PipelineError('the approved publication draft changed; publication is paused', 'needs-human');
+          }
+          await this.checkedPublicationTarget(state, false);
+          await this.publish(state, approval.approvedHead);
+          state.status = 'succeeded';
+        }
+        return await this.finish(state);
+      }
       if (this.cfg.stages.plan.enabled !== false && (!state.plan || state.planFeedback)) {
         await this.planStage(state);
         if (state.status === 'awaiting-plan-approval') return await this.finish(state);
@@ -235,9 +546,18 @@ export class Pipeline {
   // ------------------------------------------------------------------ prepare
 
   private async prepare(state: RunState): Promise<void> {
+    if (state.workspaceMode === 'directory') {
+      if (!(await exists(this.repo))) throw new PipelineError('the project directory is missing', 'needs-human');
+      state.worktree = this.repo;
+      await this.store.save(state);
+      return;
+    }
+    if (state.flow && state.worktree && !(await exists(state.worktree))) {
+      throw new PipelineError('the custom workflow worktree is missing; refusing to recreate it', 'needs-human');
+    }
     if (state.worktree && (await exists(state.worktree))) {
       // A saved worktree whose setup never finished: complete it now (no-op when setup is done).
-      await this.runSetup(state);
+      if (!state.flow) await this.runSetup(state);
       return;
     }
     await this.checkpoint(state, 'prepare');
@@ -264,7 +584,7 @@ export class Pipeline {
     state.setupDone = false;
     this.log.stage('prepare', `branch ${state.branch} from ${state.base.branch}@${baseSha.slice(0, 8)}`);
     await this.store.save(state);
-    await this.runSetup(state);
+    if (!state.flow) await this.runSetup(state);
   }
 
   private async runSetup(state: RunState): Promise<void> {
@@ -484,7 +804,7 @@ export class Pipeline {
   private async implementLoop(state: RunState): Promise<boolean> {
     // An approved commit is already saved: go straight to release/publish with that exact SHA.
     // No new implement round, and an exhausted round budget cannot block it.
-    if (state.rounds.some((r) => r.decision === 'approved' && r.implement)) return true;
+    if (state.rounds.some((r) => !r.superseded && r.decision === 'approved' && r.implement)) return true;
     for (;;) {
       let round = state.rounds[state.rounds.length - 1];
       if (!round || round.decision) {
@@ -689,7 +1009,7 @@ export class Pipeline {
   // ------------------------------------------------------------------ release & publish
 
   private approvedSha(state: RunState): string {
-    const r = [...state.rounds].reverse().find((x) => x.decision === 'approved');
+    const r = [...state.rounds].reverse().find((x) => !x.superseded && x.decision === 'approved');
     if (!r?.implement) throw new PipelineError('no approved commit to release');
     return r.implement.sha;
   }
@@ -752,9 +1072,8 @@ export class Pipeline {
    * Several push addresses, or a PR on an address that is not github.com, cannot be tied to one
    * target, so the run stops before doing anything.
    */
-  private async writeTarget(needsGithubRepo: boolean): Promise<NonNullable<RunState['publish']['inFlightTarget']>> {
+  private async writeTarget(needsGithubRepo: boolean, urls: string[]): Promise<NonNullable<RunState['publish']['inFlightTarget']>> {
     const remote = this.cfg.publish.remote;
-    const urls = await this.ops.pushUrls(this.repo, remote);
     if (urls.length === 0) throw new PipelineError(`remote "${remote}" is not configured`, 'needs-human');
     if (urls.length > 1) {
       throw new PipelineError(
@@ -769,6 +1088,20 @@ export class Pipeline {
       throw new PipelineError(`remote "${remote}" pushes to ${url}, which is not a github.com address, so the pull request repository cannot be identified`, 'needs-human');
     }
     return { remote, url, githubRepo };
+  }
+
+  private async checkedPublicationTarget(state: RunState, needsGithubRepo: boolean) {
+    const urls = await this.ops.pushUrls(this.repo, this.cfg.publish.remote);
+    const target = await this.writeTarget(needsGithubRepo, urls);
+    if (state.flow) {
+      const last = state.flow.workflow.steps.at(-1);
+      const approved = last && state.steps?.[last.id]?.approval?.approvedTarget;
+      if (!approved || target.remote !== approved.remote || target.url !== approved.url ||
+          await fingerprintRemoteAddress(urls[0], false) !== approved.fingerprint) {
+        throw new PipelineError('the full approved push destination changed; publication is paused', 'needs-human');
+      }
+    }
+    return { target, address: urls[0] };
   }
 
   private async publish(state: RunState, approvedSha: string): Promise<void> {
@@ -794,16 +1127,20 @@ export class Pipeline {
     const wt = state.worktree!;
     const branch = state.branch!;
     // Only ship exactly what was approved.
-    const head = await G.headSha(wt);
-    if (head !== approvedSha) {
-      throw new PipelineError(`worktree HEAD ${head.slice(0, 8)} differs from the approved commit ${approvedSha.slice(0, 8)}; refusing to publish`, 'needs-human');
+    const needsBranch = (p.push && !state.publish.pushed) || (p.createPr && !state.publish.prUrl) || (p.merge && !state.publish.merged);
+    if (needsBranch) {
+      const head = await G.headSha(wt);
+      if (head !== approvedSha) throw new PipelineError(`worktree HEAD ${head.slice(0, 8)} differs from the approved commit ${approvedSha.slice(0, 8)}; refusing to publish`, 'needs-human');
+      const currentBranch = await G.currentBranch(wt);
+      const branchHead = (await G.git(wt, ['rev-parse', '--verify', `refs/heads/${branch}`], { allowFail: true })).trim();
+      if (currentBranch !== branch || branchHead !== approvedSha) throw new PipelineError(`the task branch ${branch} is not checked out at the approved commit; refusing to publish`, 'needs-human');
+      if (await G.isDirty(wt)) throw new PipelineError('worktree has uncommitted changes; refusing to publish', 'needs-human');
     }
-    if (await G.isDirty(wt)) throw new PipelineError('worktree has uncommitted changes; refusing to publish', 'needs-human');
     await this.checkpoint(state, 'publish');
     const rel = state.release!;
 
     if (p.push && !state.publish.pushed) {
-      await this.markInFlight(state, 'push', await this.writeTarget(false));
+      await this.markInFlight(state, 'push', (await this.checkedPublicationTarget(state, false)).target);
       await this.ops.push(wt, p.remote, branch);
       state.publish.inFlight = undefined;
       state.publish.pushed = true;
@@ -812,7 +1149,7 @@ export class Pipeline {
     }
     if (p.createPr && !state.publish.prUrl) {
       if (!(await this.ops.ghAvailable(wt))) throw new PipelineError('publish.createPr needs the GitHub CLI ("gh") installed and logged in', 'needs-human');
-      const target = await this.writeTarget(true);
+      const { target } = await this.checkedPublicationTarget(state, true);
       await this.markInFlight(state, 'pr', target);
       const created = await this.ops.ghCreatePr(wt, {
         repo: target.githubRepo!,
@@ -833,16 +1170,18 @@ export class Pipeline {
     }
     if (p.merge && !state.publish.merged) {
       const pr = state.publish.prUrl!;
-      const target = await this.writeTarget(true);
+      const { target } = await this.checkedPublicationTarget(state, true);
       if (G.githubRepoOfPr(pr) !== target.githubRepo) {
         throw new PipelineError(`the pull request ${pr} is not in ${target.githubRepo}, the repository this run pushes to; refusing to merge it`, 'needs-human');
       }
       await this.markInFlight(state, 'merge', target);
       await this.ops.ghMarkReady(wt, pr, target.githubRepo!);
       await this.ops.ghMergePr(wt, pr, approvedSha, target.githubRepo!);
+      const mergeSha = await this.ops.ghMergeCommit(wt, pr, target.githubRepo!);
+      if (!/^[0-9a-f]{40}$/i.test(mergeSha)) throw new PipelineError('the merge may have completed but its commit could not be confirmed; check the remote', 'needs-human');
       state.publish.inFlight = undefined;
       state.publish.merged = true;
-      state.publish.mergeSha = (await this.ops.ghMergeCommit(wt, pr, target.githubRepo!)) || undefined;
+      state.publish.mergeSha = mergeSha;
       this.log.stage('publish', `merged ${pr}`);
       await this.store.save(state);
     }
@@ -853,7 +1192,7 @@ export class Pipeline {
 
   private async tagRelease(state: RunState, rel: ReleaseDraft): Promise<void> {
     const p = this.cfg.publish;
-    if (rel.version_bump === 'none' || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(rel.suggested_version)) {
+    if ((!state.flow && rel.version_bump === 'none') || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(rel.suggested_version)) {
       this.log.warn(`skipping tag: release stage gave no usable version ("${rel.suggested_version}", bump ${rel.version_bump})`);
       return;
     }
@@ -865,8 +1204,7 @@ export class Pipeline {
     // The merge commit lives where the PR was merged: the repository this run writes to, which can
     // differ from the read address. Fetch it from there and confirm it is on that repository's base
     // branch before anything is tagged.
-    const target = await this.writeTarget(false);
-    const [address] = await this.ops.pushUrls(root, p.remote);
+    const { target, address } = await this.checkedPublicationTarget(state, false);
     if (!(await this.ops.fetchMergeCommit(root, address, state.base!.branch, sha))) {
       throw new PipelineError(`merge commit ${sha.slice(0, 8)} is not on ${state.base!.branch} at ${target.url}, the repository this run writes to; refusing to tag it`, 'needs-human');
     }
@@ -887,11 +1225,8 @@ export class Pipeline {
   async cleanup(idOrPrefix: string, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     const id = await this.store.resolve(idOrPrefix);
     const state = await this.store.load(id);
-    if (state.worktree) await G.removeWorktree(this.repo, state.worktree);
+    await cleanupRun(this.store, this.repo, id, () => false, G.removeWorktree);
     if (opts.deleteBranch && state.branch) await G.git(this.repo, ['branch', '-D', state.branch], { allowFail: true });
-    await ensureDir(this.store.dir(id));
-    state.worktree = undefined;
-    await this.store.save(state);
   }
 }
 

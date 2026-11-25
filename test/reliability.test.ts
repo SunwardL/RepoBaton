@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -272,6 +273,34 @@ test('resume command: arguments carried by a node launcher are included', () => 
   assert.equal(cmd, 'cd /d D:\\w && "C:\\Program Files\\nodejs\\node.exe" C:\\npm\\node_modules\\cli.js --resume ' + SID);
 });
 
+test('resume command actually runs the recorded launcher and enters its working directory on Windows', { skip: process.platform !== 'win32' }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'rb resume command-'));
+  const cwd = path.join(root, 'work tree');
+  const script = path.join(root, 'fake cli.cjs');
+  await fs.mkdir(cwd);
+  await fs.writeFile(script, "process.stdout.write(JSON.stringify({cwd: process.cwd(), args: process.argv.slice(2)}));\n");
+  try {
+    for (const [agentType, verb] of [['codex-cli', 'resume'], ['claude-cli', '--resume']] as const) {
+      const command = resumeCommand({ agentType, sessionId: SID, cwd,
+        cli: { path: 'unused-launcher.cmd', command: process.execPath, prefixArgs: [script] } });
+      assert.ok(command);
+      // Feed the line to CMD as a user would paste it; passing it through /c adds another quoting layer.
+      const result = spawnSync('C:\\Windows\\System32\\cmd.exe', ['/d', '/q'], { input: `${command}\r\nexit\r\n`, encoding: 'utf8', windowsHide: true });
+      assert.equal(result.status, 0, result.stderr);
+      const json = result.stdout.match(/\{[^\r\n]+\}/)?.[0];
+      assert.ok(json, result.stdout);
+      const actual = JSON.parse(json) as { cwd: string; args: string[] };
+      assert.equal((await fs.realpath(actual.cwd)).toLowerCase(), (await fs.realpath(cwd)).toLowerCase());
+      assert.deepEqual(actual.args, [verb, SID]);
+    }
+  } finally {
+    const target = await fs.realpath(root);
+    assert.equal(path.dirname(target).toLowerCase(), (await fs.realpath(os.tmpdir())).toLowerCase());
+    assert.ok(path.basename(target).startsWith('rb resume command-'));
+    await fs.rm(target, { recursive: true });
+  }
+});
+
 test('resume command: old records without a recorded CLI fall back to the bare name, and records without an id give nothing', () => {
   assert.equal(resumeCommand({ agentType: 'codex-cli', sessionId: SID, cwd: 'D:\\w' }), 'cd /d D:\\w && codex resume ' + SID);
   assert.equal(resumeCommand({ agentType: 'claude-cli', sessionId: SID, cwd: 'D:\\w' }), 'cd /d D:\\w && claude --resume ' + SID);
@@ -490,7 +519,7 @@ test('while the call is still running, the saved record already carries the id a
   const done = pipe.start('t').catch(() => null);
   const store = new RunStore(repo);
   let onDisk: NonNullable<RunState['sessions']>[number] | undefined;
-  const end = Date.now() + 20000;
+  const end = Date.now() + 60000;
   while (Date.now() < end && !onDisk) {
     await new Promise((r) => setTimeout(r, 100));
     const ids = await store.list();

@@ -2,7 +2,7 @@
 
 <p align="center"><strong>Local workflows for Codex, Claude Code, and compatible agents</strong></p>
 
-<p align="center">Hand a Git task from planning to implementation and review.<br>Follow every step from your browser or terminal.</p>
+<p align="center">Coordinate local agents on your projects.<br>Choose the steps, handoffs, and workflow from your browser.</p>
 
 <p align="center">
   <a href="https://github.com/SunwardL/RepoBaton/releases/latest"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/SunwardL/RepoBaton?style=flat-square&amp;color=5267df"></a>
@@ -24,7 +24,7 @@
 
 ## Quick start
 
-You need **Node.js 22.18+**, **Git**, and a Git project with at least one commit. The default workflow uses locally authenticated Claude Code and Codex CLIs. You can also [configure API agents or another CLI](#configuration).
+You need **Node.js 22.18+** and Git to clone this repository. The built-in workflow requires a Git project with at least one commit; a custom workflow also works in an ordinary local folder. Configure locally authenticated Claude Code and Codex CLIs, or [configure API agents or another CLI](#configuration).
 
 ```shell
 git clone https://github.com/SunwardL/RepoBaton.git
@@ -76,7 +76,15 @@ flowchart LR
 | **Test and review** | Run the project's test command, then review the commit in a fresh session. By default, failed tests and blocking findings require another round. |
 | **Release draft** | Collect the approved change, a suggested version, PR text, and release notes. Remote publish steps are opt-in. |
 
-The dashboard remembers projects and shows progress, diffs, and reports. Each Git repository can run one task at a time, including its linked worktrees. Separate repositories can run at the same time. When a repository is busy, the dashboard asks you to try again after the active run stops.
+The dashboard remembers projects and shows progress, diffs, and reports. Each Git repository can run one task at a time, including its linked worktrees. Separate projects can run at the same time. When a project is busy, the dashboard asks you to try again after the active run stops.
+
+For a custom workflow, choose **自定义流程** when creating a task. Add and reorder agent, command, human confirmation, or Git commit steps; choose agents and write their prompts. Add the task, previous outputs, or workspace files as inputs so each agent receives the intended handoff. YAML import and export are optional. Before starting, review the steps and commands in the confirmation panel.
+
+The run page can show a redacted, size-limited record of the prompt actually sent to an agent. Each agent still manages its own native conversation; this record does not include its earlier native context.
+
+In a Git project with commits, custom steps share a dedicated worktree. You can leave changes uncommitted, add an explicit commit step, or ask an agent to manage Git. In an ordinary folder or a repository without commits, custom steps work directly in the selected folder, so edits affect those files immediately. Git and publishing are not required for a custom workflow.
+
+Custom workflows can optionally push, open or merge a PR, and tag a release. Add a commit step and a final approval step; the approval shows the exact commit, destination, and publication details. If a remote operation is interrupted, check its result before continuing. Push and recovery have been exercised with local Git remotes; PR, merge, and tag operations have been tested with substitutes, not a live GitHub repository.
 
 ## Configuration
 
@@ -127,11 +135,15 @@ Every stage call (plan, implement, review, release draft) is recorded in the run
 - Agents that report no session id (API and command agents) show their RepoBaton events and results only, with no native session entry.
 - Runs saved before this feature show that the native session cannot be located. Their details and artifacts stay available.
 
-Verified on Windows with Codex CLI 0.171.0-alpha.13 and Claude Code 2.1.319: a session created by RepoBaton resumes by id (`codex exec resume <id>`, `claude --resume <id>`) from its recorded worktree and remembers the earlier work. Codex records the working directory in its session file under `~/.codex/sessions`, and Claude Code stores sessions under `~/.claude/projects`. Whether the Codex desktop app lists sessions created by the CLI has not been verified, so this page does not promise it.
+Verified on Windows with Codex CLI 0.171.0-alpha.13 and Claude Code 2.1.319: a session created by RepoBaton resumes by id (`codex exec resume <id>`, `claude --resume <id>`) from its recorded worktree and remembers the earlier work. Codex records the working directory in its session file under `~/.codex/sessions`, and Claude Code stores sessions under `~/.claude/projects`. A test CLI session could not be located in the Codex desktop conversation list; use the recorded ID and CLI resume command to continue it. This observation does not establish how every desktop version or project displays CLI sessions.
 
 ## Recovery
 
 If the local server can confirm that it previously owned a run and its owner process is gone, it shows the run as **Interrupted**. Choose **Continue** to pick up from a saved checkpoint. If a commit already passed review, recovery carries that SHA into the remaining steps. Cleanup removes the selected worktree and keeps its branch and commits. Use the UI or the standalone CLI to manage a given run.
+
+Custom steps interrupted while running are marked **result unknown** and are not rerun automatically. A commit step can be recognized as complete only when its recorded parent and tree match and Git has no unfinished operation or index lock. Inspect the workspace and any external side effects before explicitly retrying. Cleanup refuses to discard uncommitted files without a current preview and confirmation; a task using the original project folder cannot remove that folder through cleanup.
+
+You can take over a paused task in the native workspace and return it to RepoBaton. Use **打开工作区** in the task details to open its recorded folder in Windows File Explorer, or copy the path to use another tool. The built-in workflow pauses if the task worktree is on a different branch. Human commits are tested and reviewed again before the built-in workflow proceeds.
 
 <details>
 <summary><strong>Recover an interrupted push, PR, merge, or tag</strong></summary>

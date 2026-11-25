@@ -39,6 +39,24 @@ export function stepDir(runDir: string, stepId: string): string {
 
 const relativeOutput = (stepId: string) => `steps/${stepId}/output.txt`;
 
+/** Keep a redacted, bounded record of the exact input sent on this attempt. */
+export async function writeStepPrompt(runDir: string, stepId: string, attempt: number, prompt: string): Promise<{ attempt: number; sha256: string; truncated: boolean; originalBytes: number }> {
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw new Error('invalid prompt attempt');
+  const masked = redactDiagnostic(prompt);
+  const originalBytes = Buffer.byteLength(masked);
+  const cut = cutUtf8(masked, MAX_INJECT_HARD);
+  const stored = cut.cut ? `${cut.text}\n[提示词记录已截断，原始 ${originalBytes} 字节]\n` : cut.text;
+  await writeFileAtomic(path.join(stepDir(runDir, stepId), `prompt-${attempt}.txt`), stored, 0o600);
+  return { attempt, sha256: createHash('sha256').update(stored).digest('hex'), truncated: cut.cut, originalBytes };
+}
+
+export async function readStepPrompt(runDir: string, stepId: string, ref: { attempt: number; sha256: string }): Promise<string> {
+  if (!Number.isSafeInteger(ref.attempt) || ref.attempt < 1 || !/^[0-9a-f]{64}$/.test(ref.sha256)) throw new Error('invalid prompt record');
+  const text = await fs.readFile(path.join(stepDir(runDir, stepId), `prompt-${ref.attempt}.txt`), 'utf8');
+  if (createHash('sha256').update(text).digest('hex') !== ref.sha256) throw new Error('prompt record is corrupt');
+  return text;
+}
+
 /**
  * Stores a step's output. Masking happens before the storage cut: a secret that straddles the cut
  * would otherwise leave an unmasked prefix on disk.

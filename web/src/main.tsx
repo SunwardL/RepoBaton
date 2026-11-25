@@ -56,11 +56,6 @@ function App() {
     };
   }, [refresh]);
 
-  // Open the first project when none is chosen yet.
-  useEffect(() => {
-    if (projects && projects.length && !route.project && !route.agents) go(projects[0].id);
-  }, [projects, route.project, route.agents]);
-
   if (!hasToken() || fatal === 'token') {
     return (
       <div className="card gate">
@@ -112,11 +107,13 @@ function App() {
           <h2>项目</h2>
           <div className="plist">
             {projects?.map((p) => (
-              <button key={p.id} className={`pitem ${p.id === route.project ? 'on' : ''}`} onClick={() => go(p.id)} title={p.root}>
+              <div key={p.id} className="project-entry"><button className={`pitem ${p.id === route.project ? 'on' : ''}`} onClick={() => go(p.id)} title={p.root}>
                 <span className={`dot ${!p.available ? 'gone' : p.busy ? 'busy' : ''}`} aria-hidden="true" />
                 <span className="nm">{p.name}</span>
                 {p.needsAttention > 0 ? <span className="badge" title="需要你处理的任务">{p.needsAttention}</span> : null}
-              </button>
+              </button><button type="button" className="project-remove" aria-label={`移除 ${p.name}`} title="从列表移除（不会删除文件）" onClick={() => {
+                void api.removeProject(p.id).then(() => { if (route.project === p.id) go(); void refresh(); }).catch((error) => toast.show(errorText(error), 'err'));
+              }}>×</button></div>
             ))}
             {projects && projects.length === 0 ? <p style={{ padding: '4px 10px', fontSize: 13 }}>还没有项目</p> : null}
           </div>
@@ -139,7 +136,7 @@ function App() {
         ) : projects === null ? (
           <p className="muted">加载中…</p>
         ) : !current ? (
-          <div className="empty"><h2>选择或添加一个项目</h2>在左侧输入一个本地 Git 仓库的路径。同一个仓库的子目录或工作区会被识别为同一个项目。</div>
+          <div className="empty"><h2>选择或添加一个项目</h2>在左侧输入一个本地项目文件夹的路径。</div>
         ) : route.run ? (
           <RunView key={`${current.id}/${route.run}`} projectId={current.id} runId={route.run} notify={toast.show} onBack={() => go(current.id)} />
         ) : route.settings ? (

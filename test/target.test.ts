@@ -87,6 +87,25 @@ async function fixture(publish: Partial<ReturnType<typeof defaultConfig>['publis
 const registry = { get: () => ({}) } as unknown as AgentRegistry;
 const refs = async (bareDir: string): Promise<string> => (await git(bareDir, ['for-each-ref', '--format=%(refname)'])).trim();
 
+test('publishing refuses a branch switched by a release agent at the same SHA', async () => {
+  const f = await fixture({ push: true });
+  await git(f.repo, ['remote', 'set-url', '--push', 'origin', f.pushRepo]);
+  const state = await f.store.load('run1');
+  state.release = undefined;
+  await f.store.save(state);
+  const draft = { version_bump: 'patch', suggested_version: '1.0.1', pr_title: 't', pr_body: 'b', release_notes: 'n', risks: [] };
+  const agent = { id: 'a', type: 'command', describe: () => 'fake', run: async () => {
+    await git(f.wt, ['checkout', '-q', '-b', 'alternate-at-approved-sha']);
+    return { text: JSON.stringify(draft), structured: draft, durationMs: 1 };
+  } };
+  const fakeRegistry = { get: () => agent } as unknown as AgentRegistry;
+  const out = await new Pipeline({ repo: f.repo, config: f.config, registry: fakeRegistry }).resume('run1');
+  assert.equal(out.status, 'needs-human');
+  assert.match(out.error ?? '', /task branch.*not checked out/);
+  assert.equal(await refs(f.pushRepo), '');
+  assert.equal((await f.store.load('run1')).publish.inFlight, undefined);
+});
+
 /** A real push that completes on the remote, after which the process "dies" before recording it. */
 const crashAfter = (name: 'push' | 'pushTag'): RemoteOps => ({
   ...realRemoteOps,
@@ -288,6 +307,23 @@ test('create, merge and the recovery query all name the same GitHub repository e
   const r = await checkAndRecord(f.store, f.repo, f.config, 'run1', {}, gh);
   assert.ok(r.ok && r.recorded === 'done', JSON.stringify(r));
   assert.deepEqual(gh.calls, [{ op: 'view', repo: 'github.com/owner/repo', ref: 'repobaton/x' }]);
+});
+
+test('a merged PR with an unreadable merge commit remains in-flight for remote recovery', async () => {
+  const { f, gh } = await prFixture('https://github.com/o/r.git', { merge: true });
+  gh.ghMergeCommit = async () => '';
+  const pipeline = new Pipeline({ repo: f.repo, config: f.config, registry, remote: gh });
+  const paused = await pipeline.resume('run1');
+  assert.equal(paused.status, 'needs-human');
+  assert.equal(paused.publish.inFlight, 'merge');
+  assert.equal(paused.publish.merged, undefined);
+  const checked = await checkAndRecord(f.store, f.repo, f.config, 'run1', {}, gh);
+  assert.equal(checked.ok, true);
+  if (checked.ok) assert.equal(checked.recorded, 'done');
+  const resumed = await pipeline.resume('run1');
+  assert.equal(resumed.status, 'succeeded', resumed.error);
+  assert.equal(resumed.publish.mergeSha, 'b'.repeat(40));
+  assert.equal(gh.calls.filter((call) => call.op === 'merge').length, 1);
 });
 
 test('a pull request answer from another repository is a conflict that no evidence overrides', async () => {

@@ -4,8 +4,9 @@ import { ERROR_HINT } from './common';
 
 export function eventClass(e: RunEvent): string {
   if (e.type === 'agent.failed' || e.type === 'log.error') return 'bad';
+  if (e.type === 'step.finished' && (e.data?.status === 'failed' || e.data?.status === 'unknown')) return 'bad';
   if (e.type === 'run.finished' && e.data?.status === 'succeeded') return 'ok';
-  if (e.type === 'stage.started') return 's';
+  if (e.type === 'stage.started' || e.type === 'step.started') return 's';
   return '';
 }
 
@@ -18,6 +19,7 @@ export function eventText(e: RunEvent): string {
       return `✕ ${e.stage ?? ''} 失败${kind ? `(${kind})` : ''}:${e.message}`;
     }
     case 'stage.started':
+    case 'step.started':
       return `── ${e.message}`;
     case 'run.started':
       return `开始:${e.message}`;

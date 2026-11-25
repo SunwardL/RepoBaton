@@ -160,8 +160,17 @@ test('git policy: commit steps need explicit-step, publish only with explicit-st
   assert.ok(has(errors(flow([agent('a')], { mode: 'wat' as never })), 'Git'));
 });
 
-test('agent-managed is not opened in the first version', () => {
-  assert.ok(has(errors(flow([agent('a')], { mode: 'agent-managed' })), '暂未开放'));
+test('agent-managed allows agents to control Git without a commit step', () => {
+  assert.equal(errors(flow([agent('a')], { mode: 'agent-managed' })).length, 0);
+});
+
+test('custom publishing requires an explicit commit and a final human confirmation', () => {
+  const commit = { id: 'save', title: 'save', type: 'commit', message: 'save' } as Workflow['steps'][number];
+  const approval = { id: 'confirm', title: 'confirm', type: 'approval', show: [{ kind: 'task' }] } as Workflow['steps'][number];
+  assert.deepEqual(errors(flow([agent('a'), commit, approval], { mode: 'explicit-step', publish: { push: true } })), []);
+  assert.ok(has(errors(flow([agent('a'), commit], { mode: 'explicit-step', publish: { push: true } })), '人工确认'));
+  assert.ok(has(errors(flow([agent('a'), approval], { mode: 'explicit-step', publish: { push: true } })), '提交步骤'));
+  assert.ok(has(errors(flow([agent('a'), commit, approval], { mode: 'explicit-step', publish: { push: true, createPr: true, merge: true, tag: true } })), '版本号'));
 });
 
 test('approval steps must show something and are validated like references', () => {

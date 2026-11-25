@@ -1,4 +1,6 @@
 import { redactDiagnostic } from './redact.ts';
+import type { FlowKind, StepState, Workflow } from './flow-types.ts';
+import type { FlowAgentSnapshot } from './flow-config.ts';
 export type StageName = 'plan' | 'implement' | 'review' | 'release';
 export type Access = 'read-only' | 'workspace-write';
 export type AgentType =
@@ -217,6 +219,8 @@ export interface ReleaseDraft {
 
 export interface Round {
   n: number;
+  /** A later human change requires a fresh review; the original decision remains in history. */
+  superseded?: boolean;
   implement?: {
     agent: string;
     sha: string;
@@ -327,6 +331,10 @@ export interface RunState {
   base?: { branch: string; sha: string };
   branch?: string;
   worktree?: string;
+  /** Ordinary directories are edited in place and must never be removed as worktrees. */
+  workspaceMode?: 'directory' | 'worktree';
+  humanControl?: { startedAt: string; headBefore?: string; branchBefore?: string; dirtyBefore?: boolean };
+  handoff?: { returnedAt: string; headBefore?: string; headAfter?: string; branchBefore?: string; branchAfter?: string; status?: string; reviewRequired?: boolean };
   /**
    * Set only when a local server launches the run. It names the server instance, so a later
    * server can tell "mine, still executing", "an earlier server's, now gone" and "no server
@@ -352,4 +360,7 @@ export interface RunState {
   release?: ReleaseDraft;
   publish: PublishState;
   usage: { costUsd: number; inputTokens: number; outputTokens: number; calls: number };
+  /** Present only for custom flows; a run without it is a built-in four-stage run and takes the original path. */
+  flow?: { schema: 1; kind: FlowKind; name: string; workflow: Workflow; hash: string; agents?: Record<string, FlowAgentSnapshot>; startConfirmation?: { hash: string; at: string }; publishConfig?: Config['publish'] };
+  steps?: Record<string, StepState>;
 }

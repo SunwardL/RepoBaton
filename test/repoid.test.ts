@@ -6,7 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { git } from '../src/git.ts';
 import { ProjectRegistry } from '../src/projects.ts';
-import { comparablePath, identifyRepo, NotAGitRepoError, realPath } from '../src/repoid.ts';
+import { comparablePath, identifyProject, identifyRepo, NotAGitRepoError, realPath } from '../src/repoid.ts';
 
 async function makeRepo(prefix = 'rb-id-'): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -100,13 +100,54 @@ test('project registry: stores, de-duplicates by repository and survives a resta
   assert.equal((await new ProjectRegistry(file).list()).length, 1);
 });
 
-test('project registry: rejects non-repositories and tolerates a corrupt file', async () => {
+test('project registry: accepts directories and tolerates a corrupt file', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-reg-'));
   const file = path.join(dir, 'projects.json');
   const reg = new ProjectRegistry(file);
-  await assert.rejects(reg.add(dir), NotAGitRepoError);
+  const project = await reg.add(dir);
+  assert.equal(project.root, realPath(dir));
+  await assert.rejects(reg.add(path.join(dir, 'missing')));
+  const broken = path.join(dir, 'broken');
+  await fs.mkdir(path.join(broken, '.git'), { recursive: true });
+  await assert.rejects(reg.add(broken), /cannot identify the Git repository/);
   await fs.writeFile(file, '{not json');
   assert.deepEqual(await reg.list(), []);
+});
+
+test('initializing Git preserves a directory project identity and execution slot', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-init-project-'));
+  const file = path.join(dir, 'projects.json');
+  const registry = new ProjectRegistry(file);
+  const project = await registry.add(dir);
+  const before = await identifyProject(dir);
+  await git(dir, ['init', '-q', '-b', 'main']);
+  const after = await identifyProject(dir);
+  assert.equal(after.slotKey, before.slotKey);
+  assert.equal((await registry.get(project.id))?.root, project.root);
+  assert.equal((await registry.add(dir)).id, project.id);
+  assert.equal((await new ProjectRegistry(file).list()).length, 1);
+});
+
+test('legacy project IDs are saved before a directory changes identity', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-legacy-project-'));
+  const file = path.join(dir, 'projects.json');
+  await fs.writeFile(file, JSON.stringify({ version: 1, projects: [{ name: 'legacy', root: dir, addedAt: '2026-01-01' }] }));
+  const registry = new ProjectRegistry(file);
+  const before = (await registry.list())[0];
+  await registry.stabilize();
+  await git(dir, ['init', '-q', '-b', 'main']);
+  assert.equal((await new ProjectRegistry(file).list())[0].id, before.id);
+});
+
+test('project registry does not trust path-like stored IDs', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-invalid-project-id-'));
+  const file = path.join(dir, 'projects.json');
+  await fs.writeFile(file, JSON.stringify({ version: 1, projects: [{ id: '../other', name: 'local', root: dir, addedAt: '2026-01-01' }] }));
+  const registry = new ProjectRegistry(file);
+  const project = (await registry.list())[0];
+  assert.match(project.id, /^[0-9a-z]{7}$/);
+  await registry.stabilize();
+  assert.equal((await new ProjectRegistry(file).list())[0].id, project.id);
 });
 
 test('concurrent adds do not lose entries', async () => {

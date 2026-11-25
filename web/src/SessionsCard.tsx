@@ -29,7 +29,7 @@ export function SessionsCard({ run }: { run: RunDetail }) {
           return (
             <div key={`${s.label}-${i}`} style={{ padding: '8px 0', borderTop: i ? '1px solid var(--line, #ddd)' : undefined }}>
               <div>
-                <b>{STAGE_LABEL[s.stage] ?? s.stage}</b>
+                <b>{run.flow ? s.label : STAGE_LABEL[s.stage] ?? s.stage}</b>
                 {s.round ? ` · 第 ${s.round} 轮` : ''} <span className="chip">{s.agent}</span> <span className="muted">{STATUS_LABEL[s.status]}</span>
               </div>
               {s.sessionId ? (

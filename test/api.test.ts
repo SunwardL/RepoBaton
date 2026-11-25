@@ -7,6 +7,8 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { AnthropicCompatibleAgent, OpenAiCompatibleAgent } from '../src/agents/api.ts';
 import { execTool } from '../src/agents/tools.ts';
+import { defaultConfig } from '../src/config.ts';
+import { Pipeline } from '../src/pipeline.ts';
 import { REVIEW_SCHEMA } from '../src/prompts.ts';
 
 interface Hit {
@@ -90,6 +92,63 @@ test('missing API key fails without a network call', async () => {
   delete process.env.NO_SUCH_KEY;
   const agent = new OpenAiCompatibleAgent('gpt', { type: 'openai-compatible', model: 'm', apiKeyEnv: 'NO_SUCH_KEY' });
   await assert.rejects(agent.run({ ...baseReq, cwd: os.tmpdir() }), /no API key/);
+});
+
+test('a provider error cannot expose an API key from an arbitrarily named environment variable', async () => {
+  const value = 'plain-provider-value-937412';
+  const old = process.env.RB_AUTH;
+  process.env.RB_AUTH = value;
+  const server = http.createServer((_req, res) => { res.statusCode = 401; res.end(`credential rejected: ${value}`); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    for (const agent of [
+      new OpenAiCompatibleAgent('openai', { type: 'openai-compatible', baseUrl, model: 'm', apiKeyEnv: 'RB_AUTH' }),
+      new AnthropicCompatibleAgent('anthropic', { type: 'anthropic-compatible', baseUrl, model: 'm', apiKeyEnv: 'RB_AUTH' }),
+    ]) {
+      await assert.rejects(agent.run({ ...baseReq, cwd: os.tmpdir() }), (error: Error) => {
+        assert.doesNotMatch(error.message, new RegExp(value));
+        assert.match(error.message, /\[redacted\]/);
+        return true;
+      });
+    }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (old === undefined) delete process.env.RB_AUTH;
+    else process.env.RB_AUTH = old;
+  }
+});
+
+test('provider errors with arbitrary env names stay redacted in run state, events and report', async () => {
+  const value = 'plain-integration-value-936102';
+  const previous = process.env.RB_AUTH;
+  process.env.RB_AUTH = value;
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-api-redaction-'));
+  const server = http.createServer((_req, res) => { res.statusCode = 401; res.end(`provider echoed ${value}`); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const config = defaultConfig();
+    config.agents = { provider: { type: 'openai-compatible', model: 'm', apiKeyEnv: 'RB_AUTH',
+      baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}` } };
+    const pipeline = new Pipeline({ repo: dir, config });
+    const state = await pipeline.startFlow('test', { schema: 1, kind: 'custom', name: 'redaction', git: { mode: 'none' }, steps: [
+      { id: 'call', title: 'call', type: 'agent', agent: 'provider', access: 'read-only', prompt: '{{task}}', output: { kind: 'text' } },
+    ] });
+    assert.equal(state.status, 'failed');
+    const runDir = pipeline.store.dir(state.id);
+    const records = [JSON.stringify(state), await fs.readFile(path.join(runDir, 'state.json'), 'utf8'),
+      await fs.readFile(path.join(runDir, 'events.jsonl'), 'utf8'), await fs.readFile(path.join(runDir, 'report.md'), 'utf8')];
+    for (const record of records) assert.doesNotMatch(record, new RegExp(value));
+    assert.match(state.error ?? '', /\[redacted\]/);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.RB_AUTH;
+    else process.env.RB_AUTH = previous;
+    const target = await fs.realpath(dir);
+    assert.equal(path.dirname(target).toLowerCase(), (await fs.realpath(os.tmpdir())).toLowerCase());
+    assert.ok(path.basename(target).startsWith('rb-api-redaction-'));
+    await fs.rm(target, { recursive: true });
+  }
 });
 
 test('tools: read-only stages cannot write, paths cannot escape, .git is blocked', async () => {

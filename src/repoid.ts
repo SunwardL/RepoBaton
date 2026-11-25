@@ -11,6 +11,39 @@ export interface RepoIdentity {
   root: string;
 }
 
+export interface ProjectIdentity extends RepoIdentity {
+  isGit: boolean;
+  /** Stable while a normal directory is initialized as a Git repository. */
+  slotKey: string;
+}
+
+/** Identify a Git repository or an existing ordinary project directory. */
+export async function identifyProject(dir: string): Promise<ProjectIdentity> {
+  const root = realPath(dir);
+  const stat = await fs.stat(root).catch(() => undefined);
+  if (!stat?.isDirectory()) throw new Error(`project directory not found: ${dir}`);
+  try {
+    const repo = await identifyRepo(root);
+    return { ...repo, isGit: true, slotKey: comparablePath(repo.root) };
+  } catch (error) {
+    if (!(error instanceof NotAGitRepoError)) throw error;
+    // Do not silently treat a Git checkout as an ordinary directory when Git itself failed
+    // (for example, because the executable is missing or the repository is untrusted).
+    let parent = root;
+    for (;;) {
+      const marker = await fs.lstat(path.join(parent, '.git')).then(() => true).catch((err: NodeJS.ErrnoException) => {
+        if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return false;
+        throw err;
+      });
+      if (marker) throw new Error(`cannot identify the Git repository containing ${dir}`);
+      const next = path.dirname(parent);
+      if (next === parent) break;
+      parent = next;
+    }
+    return { key: `folder:${comparablePath(root)}`, root, gitDir: '', isGit: false, slotKey: comparablePath(root) };
+  }
+}
+
 /** True for Windows, where paths compare case-insensitively. */
 const CASE_INSENSITIVE = process.platform === 'win32';
 

@@ -27,11 +27,25 @@ export function renderReport(s: RunState): string {
     `- **Usage:** ${s.usage.calls} agent calls, ${s.usage.inputTokens} in / ${s.usage.outputTokens} out tokens` +
       (s.usage.costUsd ? `, $${s.usage.costUsd.toFixed(4)}` : ''),
   );
+  if (s.flow) {
+    L.push('', `## Workflow: ${s.flow.name}`);
+    for (const step of s.flow.workflow.steps) {
+      const state = s.steps?.[step.id];
+      L.push('', `### ${step.title} (${step.id})`, `- Type: ${step.type}`, `- Status: ${state?.status ?? 'pending'}`);
+      if (state?.agent) L.push(`- Agent: ${state.agent}`);
+      if (state?.reason) L.push(`- Detail: ${state.reason}`);
+      if (state?.headBefore) L.push(`- Commit: \`${state.headBefore.slice(0, 8)}\` → ${state.headAfter ? `\`${state.headAfter.slice(0, 8)}\`` : 'unknown'}`);
+      if (state?.readOnlyChanged) L.push('- The requested read-only step changed the observed worktree state; inspect it.');
+      if (state?.outputRef) L.push(`- [Step output](steps/${step.id}/output.txt)${state.outputRef.storedTruncated ? ' (truncated)' : ''}`);
+      if (state?.promptRef) L.push(`- [Redacted handoff, attempt ${state.promptRef.attempt}](steps/${step.id}/prompt-${state.promptRef.attempt}.txt)${state.promptRef.truncated ? ' (truncated)' : ''}`);
+      if (state?.approval) L.push(`- Confirmed: ${state.approval.at}`);
+    }
+  }
   if (s.plan) {
     L.push('', `## Plan${s.planAgent ? ` (by ${s.planAgent})` : ''}`, '', formatPlan(s.plan), '', '### Acceptance', formatAcceptance(s.plan));
   }
   for (const r of s.rounds) {
-    L.push('', `## Round ${r.n}${r.decision ? ` — ${r.decision}` : ' — incomplete'}`);
+    L.push('', `## Round ${r.n}${r.decision ? ` — ${r.decision}` : ' — incomplete'}${r.superseded ? ' (superseded)' : ''}`);
     if (r.implement) {
       L.push(
         `- Implement (${r.implement.agent}, ${formatDuration(r.implement.durationMs)}): ${r.implement.changedFiles.length} files, commit \`${r.implement.sha.slice(0, 8)}\``,
@@ -53,7 +67,7 @@ export function renderReport(s: RunState): string {
     }
   }
   if (s.release) {
-    L.push('', '## Release draft', `- Version bump: ${s.release.version_bump} → ${s.release.suggested_version || '?'}`, `- PR title: ${s.release.pr_title}`);
+    L.push('', '## Release draft', s.flow ? `- Version: ${s.release.suggested_version || 'not specified'}` : `- Version bump: ${s.release.version_bump} → ${s.release.suggested_version || '?'}`, `- PR title: ${s.release.pr_title}`);
     if (s.release.risks.length) L.push('- Risks:', ...s.release.risks.map((r) => `  - ${r}`));
   }
   const p = s.publish;

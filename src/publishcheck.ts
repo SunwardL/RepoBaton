@@ -1,4 +1,5 @@
 import * as G from './git.ts';
+import { fingerprintRemoteAddress } from './flow-config.ts';
 import type { PublishState, RunState } from './types.ts';
 
 /**
@@ -41,6 +42,11 @@ export interface CheckContext {
 }
 
 export function approvedShaOf(state: RunState): string | undefined {
+  if (state.flow?.kind === 'custom') {
+    const last = state.flow.workflow.steps.at(-1);
+    return last?.type === 'approval' && state.steps?.[last.id]?.status === 'succeeded'
+      ? state.steps[last.id].approval?.approvedHead : undefined;
+  }
   return [...state.rounds].reverse().find((r) => r.decision === 'approved' && r.implement)?.implement?.sha;
 }
 
@@ -334,6 +340,19 @@ export async function checkAndRecord(
   if (!op) return { ok: false, code: 'nothing-to-ack', message: 'nothing is waiting to be checked on this run' };
   const approvedSha = approvedShaOf(state);
   if (!approvedSha || !state.branch) throw new AckRefused('no-commit', 'this run has no approved commit, so there is nothing to compare the remote against');
+  if (state.flow?.kind === 'custom') {
+    const last = state.flow.workflow.steps.at(-1);
+    const target = last ? state.steps?.[last.id]?.approval?.approvedTarget : undefined;
+    if (!target?.fingerprint) throw new AckRefused('unconfirmed', 'the approved full destination cannot be verified; publication remains paused');
+    let addresses: string[];
+    try { addresses = await ops.pushUrls(repo, target.remote); }
+    catch { return { ok: false, code: 'unconfirmed', message: 'the approved destination could not be read; publication remains paused', op }; }
+    if (addresses.length !== 1) return { ok: false, code: 'contradicts-remote', message: 'the approved destination is missing or has multiple push addresses', op };
+    let actual: string;
+    try { actual = await fingerprintRemoteAddress(addresses[0], false); }
+    catch { return { ok: false, code: 'unconfirmed', message: 'the destination fingerprint key is unavailable; publication remains paused', op }; }
+    if (actual !== target.fingerprint) return { ok: false, code: 'contradicts-remote', message: 'the full push destination changed after approval; publication remains paused', op };
+  }
   const result = await acknowledgePublish(state, { ops, repo, remote: cfg.publish.remote, branch: state.branch, approvedSha }, claim);
   if (result.ok) {
     state.error = 'the remote was checked; ready to continue';

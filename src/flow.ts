@@ -97,6 +97,10 @@ const GIT_MODES = ['none', 'explicit-step', 'agent-managed'];
 const PUBLISH_FLAGS = ['push', 'createPr', 'draftPr', 'merge', 'tag'];
 const PUBLISH_TEXT = ['tagPrefix', 'remote'];
 
+export function requestsPublish(git: Workflow['git']): boolean {
+  return !!git.publish && (git.publish.push === true || git.publish.createPr === true || git.publish.merge === true || git.publish.tag === true);
+}
+
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const posInt = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v > 0;
 
@@ -128,6 +132,7 @@ function validatePublish(publish: unknown, mode: unknown, add: Add): void {
       if (typeof value !== 'boolean') add('error', `publish.${key} 必须是 true 或 false`, undefined, field);
     } else if (PUBLISH_TEXT.includes(key)) {
       if (typeof value !== 'string' || !value.trim() || /[\s\0]/.test(value)) add('error', `publish.${key} 必须是不含空白的非空文本`, undefined, field);
+      else if (value.startsWith('-')) add('error', `publish.${key} 不能以 - 开头`, undefined, field);
     } else add('error', `publish 里有不认识的字段 ${key}`, undefined, field);
   }
   const on = PUBLISH_FLAGS.filter((k) => publish[k] === true);
@@ -136,6 +141,7 @@ function validatePublish(publish: unknown, mode: unknown, add: Add): void {
   }
   if (publish.createPr === true && publish.push !== true) add('error', 'publish.createPr 需要同时开启 push', undefined, 'git.publish');
   if (publish.merge === true && publish.createPr !== true) add('error', 'publish.merge 需要同时开启 createPr', undefined, 'git.publish');
+  if (publish.tag === true && publish.merge !== true) add('error', 'publish.tag 需要同时开启 merge', undefined, 'git.publish');
 }
 
 /**
@@ -163,11 +169,15 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
   if (!git) {
     add('error', 'Git 策略必须是一个对象，例如 { mode: none }', undefined, 'git');
   } else if (typeof mode !== 'string' || !GIT_MODES.includes(mode)) {
-    add('error', 'Git 策略 mode 必须是 none 或 explicit-step', undefined, 'git.mode');
-  } else if (mode === 'agent-managed') {
-    add('error', 'Git 策略 agent-managed 暂未开放，请使用 none 或 explicit-step', undefined, 'git.mode');
+    add('error', 'Git 策略 mode 必须是 none、explicit-step 或 agent-managed', undefined, 'git.mode');
   }
   if (git && git.publish !== undefined) validatePublish(git.publish, mode, add);
+  if (git?.release !== undefined) {
+    if (!isRecord(git.release)) add('error', 'git.release 必须是对象', undefined, 'git.release');
+    else for (const [key, value] of Object.entries(git.release)) {
+      if (!['title', 'body', 'version', 'notes'].includes(key) || typeof value !== 'string' || value.length > 20000 || (key === 'title' && /[\r\n]/.test(value))) add('error', `git.release.${key} 无效`, undefined, 'git.release');
+    }
+  }
 
   if (!Array.isArray(input.steps)) {
     add('error', '步骤必须是列表', undefined, 'steps');
@@ -176,6 +186,13 @@ export function validateWorkflow(input: unknown, opts: ValidateOptions): FlowIss
   const steps: unknown[] = input.steps;
   if (steps.length < 1) add('error', '流程至少需要 1 个步骤', undefined, 'steps');
   if (steps.length > MAX_FLOW_STEPS) add('error', `流程至多 ${MAX_FLOW_STEPS} 个步骤，当前 ${steps.length} 个`, undefined, 'steps');
+  if (git && isRecord(git.publish) && ['push', 'createPr', 'merge', 'tag'].some((key) => git.publish && isRecord(git.publish) && git.publish[key] === true)) {
+    if (!steps.some((step) => isRecord(step) && step.type === 'commit')) add('error', '发布前必须包含 Git 提交步骤', undefined, 'git.publish');
+    if (!isRecord(steps.at(-1)) || (steps.at(-1) as Record<string, unknown>).type !== 'approval') add('error', '发布前最后一步必须是人工确认', undefined, 'git.publish');
+    if (git.publish.tag === true && (!isRecord(git.release) || typeof git.release.version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(git.release.version))) {
+      add('error', '发布标签需要在 git.release.version 指定版本号', undefined, 'git.release');
+    }
+  }
 
   // First pass: ids, so references can tell missing from later.
   const position = new Map<string, number>();

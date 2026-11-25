@@ -14,6 +14,8 @@ export interface Project {
   name: string;
   root: string;
   available: boolean;
+  isGit: boolean;
+  hasCommits: boolean;
   runs: number;
   needsAttention: number;
   busy: boolean;
@@ -87,10 +89,16 @@ export interface RunDetail extends Omit<RunRow, 'rounds' | 'executing' | 'hasWor
   planVersion?: number;
   planApproved?: boolean;
   worktree?: string;
+  workspaceMode?: 'directory' | 'worktree';
+  humanControl?: { startedAt: string; headBefore?: string; branchBefore?: string; dirtyBefore?: boolean };
+  handoff?: { returnedAt: string; headBefore?: string; headAfter?: string; branchBefore?: string; branchAfter?: string; status?: string; reviewRequired?: boolean };
   base?: { branch: string; sha: string };
   release?: { version_bump: string; suggested_version: string; pr_title: string; pr_body: string; release_notes: string; risks: string[] };
-  publish: { inFlight?: string; pushed?: boolean; prUrl?: string };
+  publish: { inFlight?: string; pushed?: boolean; prUrl?: string; merged?: boolean; tag?: string; tagPushed?: boolean; pendingTag?: string };
   sessions?: StageSession[];
+  flow?: { workflow: CustomFlow };
+  steps?: Record<string, { status: string; attempt: number; reason?: string; agent?: string; agentType?: string; sessionId?: string; headBefore?: string; headAfter?: string; branchBefore?: string; branchAfter?: string; dirtyBefore?: boolean; dirtyAfter?: boolean; readOnlyChanged?: boolean; manualCompletion?: { by: 'user'; at: string }; promptRef?: { attempt: number; truncated: boolean }; truncatedRefs?: string[]; approval?: { contentHash: string }; approvalPreview?: { content: string; contentHash: string } }>;
+  flowConfigChanges?: string[];
 }
 
 export interface RunEvent {
@@ -110,6 +118,28 @@ export interface MissingSecret {
 
 export type StageName = 'plan' | 'implement' | 'review' | 'release';
 export type TaskWorkflow = Partial<Record<StageName, { agent: string; model: string }>>;
+export interface FlowStep {
+  id: string;
+  title: string;
+  type: 'agent' | 'command' | 'commit' | 'approval';
+  agent?: string;
+  fallbackAgent?: string;
+  model?: string;
+  access?: 'read-only' | 'workspace-write';
+  prompt?: string;
+  run?: string;
+  message?: string;
+  show?: Array<{ kind: 'task' } | { kind: 'step-output'; step: string } | { kind: 'step-exit-code'; step: string } | { kind: 'file'; path: string }>;
+  output?: { kind: 'text' };
+  inputs?: Array<{ kind: 'task' } | { kind: 'step-output'; step: string } | { kind: 'step-exit-code'; step: string } | { kind: 'file'; path: string }>;
+}
+export interface CustomFlow {
+  schema: 1;
+  kind: 'custom';
+  name: string;
+  git: { mode: 'none' | 'explicit-step' | 'agent-managed'; publish?: { push?: boolean; createPr?: boolean; draftPr?: boolean; merge?: boolean; tag?: boolean; tagPrefix?: string; remote?: string }; release?: { title?: string; body?: string; version?: string; notes?: string } };
+  steps: FlowStep[];
+}
 export type GlobalAgentType = 'codex-cli' | 'claude-cli' | 'openai-compatible' | 'anthropic-compatible' | 'command';
 
 export interface CommandOptions {
@@ -225,7 +255,25 @@ export const api = {
   checkAgents: (id: string) => call<{ agents: AgentConnection[] }>('POST', `${p(id)}/settings/check`, {}),
   runs: (id: string) => call<{ runs: RunRow[] }>('GET', `${p(id)}/runs`),
   createRun: (id: string, task: string, workflow?: TaskWorkflow) => call<{ id: string }>('POST', `${p(id)}/runs`, { task, workflow }),
+  createFlowRun: (id: string, task: string, flow: CustomFlow, confirmedWorkflowHash: string) => call<{ id: string }>('POST', `${p(id)}/runs`, { task, flow, confirmedWorkflowHash }),
+  previewFlowStart: (id: string, flow: CustomFlow) => call<{ flow: CustomFlow; agents: Record<string, { type: string; command?: string; hasArguments: boolean }>; hash: string; shell: string; workspace: string; workspaceMode: 'worktree' | 'directory' }>('POST', `${p(id)}/flow/start-preview`, { flow }),
+  flow: (id: string) => call<{ flow: CustomFlow | null; revision: string }>('GET', `${p(id)}/flow`),
+  saveFlow: (id: string, revision: string, flow: CustomFlow) => call<{ flow: CustomFlow; revision: string }>('PUT', `${p(id)}/flow`, { revision, flow }),
+  previewFlow: (id: string, yaml: string) => call<{ flow: CustomFlow; issues: Array<{ level: string; message: string }> }>('POST', `${p(id)}/flow/preview`, { yaml }),
+  exportFlow: (id: string, flow: CustomFlow) => call<{ yaml: string }>('POST', `${p(id)}/flow/export`, { flow }),
   run: (id: string, run: string) => call<{ run: RunDetail; executing: boolean }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}`),
+  stepOutput: (id: string, run: string, step: string) => call<{ output: { status: string; text: string; truncated: boolean } }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/steps/${encodeURIComponent(step)}`),
+  stepPrompt: (id: string, run: string, step: string) => call<{ prompt: string; attempt: number; truncated: boolean }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/steps/${encodeURIComponent(step)}/prompt`),
+  approveFlow: (id: string, run: string, stepId: string, contentHash: string) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/flow-approve`, { stepId, contentHash }),
+  retryFlow: (id: string, run: string, stepId: string, stepStatus: string) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/flow-retry`, { stepId, stepStatus }),
+  completeUnknownFlow: (id: string, run: string, stepId: string, attempt: number, output: string, exitCode?: number) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/flow-complete-unknown`, { stepId, attempt, output, exitCode }),
+  recheckUnknownCommit: (id: string, run: string, stepId: string, attempt: number) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/flow-recheck-commit`, { stepId, attempt }),
+  previewChangedCommit: (id: string, run: string, stepId: string, attempt: number) => call<{ head: string; expectedTree: string; actualTree: string; diff: string; truncated: boolean; hash: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/flow-preview-changed-commit`, { stepId, attempt }),
+  acceptChangedCommit: (id: string, run: string, stepId: string, attempt: number, hash: string) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/flow-accept-changed-commit`, { stepId, attempt, hash }),
+  reviewPublicationAgain: (id: string, run: string, expectedHash: string) => call<{ ok: boolean }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/flow-review-publication`, { expectedHash }),
+  takeover: (id: string, run: string) => call<{ ok: boolean }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/takeover`, {}),
+  returnControl: (id: string, run: string) => call<{ ok: boolean }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/return-control`, {}),
+  openWorkspace: (id: string, run: string) => call<{ ok: boolean }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/open-workspace`, {}),
   events: (id: string, run: string, after: number) =>
     call<{ events: RunEvent[]; settled: boolean; status: RunStatus }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/events?after=${after}`),
   diff: (id: string, run: string) => call<{ diff: string; stat: string; truncated?: boolean; sha?: string }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/diff`),
@@ -237,7 +285,8 @@ export const api = {
   resume: (id: string, run: string, expectStatus: RunStatus, extra: { moreRounds?: number; feedback?: string } = {}) =>
     call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/resume`, { expectStatus, ...extra }),
   cancel: (id: string, run: string) => call<{ id: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/cancel`, {}),
-  cleanup: (id: string, run: string) => call<{ removedWorktree: boolean; keptBranch?: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/cleanup`, {}),
+  cleanupPreview: (id: string, run: string) => call<{ files: string[]; unreferencedHead?: string; confirmationHash: string }>('GET', `${p(id)}/runs/${encodeURIComponent(run)}/cleanup-preview`),
+  cleanup: (id: string, run: string, discardHash?: string) => call<{ removedWorktree: boolean; keptBranch?: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/cleanup`, discardHash ? { discardHash } : {}),
   /** Ask the remote about an interrupted push/PR/merge/tag step. Evidence is only needed when the remote cannot settle it. */
   check: (id: string, run: string, body: { completed?: boolean; evidence?: { remoteSha?: string; prUrl?: string; mergeSha?: string } } = {}) =>
     call<{ ok: boolean; recorded: 'done' | 'not-done'; summary: string }>('POST', `${p(id)}/runs/${encodeURIComponent(run)}/check`, body),

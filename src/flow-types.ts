@@ -69,6 +69,8 @@ export interface GitPolicy {
   mode: 'none' | 'explicit-step' | 'agent-managed';
   /** Reuses the existing publish options; only valid with `explicit-step`. */
   publish?: Partial<Config['publish']>;
+  /** Optional text used by the built-in remote publishing operations. */
+  release?: { title?: string; body?: string; version?: string; notes?: string };
 }
 
 export interface Workflow {
@@ -85,4 +87,34 @@ export interface FlowIssue {
   step?: string;
   field?: string;
   message: string;
+}
+
+/** Per-step checkpoint stored in the run state. `running` is written to disk before the step starts. */
+export interface StepState {
+  status: StepStatus;
+  startedAt?: string;
+  finishedAt?: string;
+  attempt: number;
+  agent?: string;
+  agentType?: Config['agents'][string]['type'];
+  sessionId?: string;
+  exitCode?: number | null;
+  headBefore?: string;
+  headAfter?: string;
+  branchBefore?: string;
+  branchAfter?: string;
+  dirtyBefore?: boolean;
+  dirtyAfter?: boolean;
+  readOnlyChanged?: boolean;
+  /** Commit steps: tree hash recorded before `git commit`, used to verify an interrupted commit. */
+  expectedTree?: string;
+  indexTreeBefore?: string;
+  outputRef?: { bytes: number; sha256: string; truncated: boolean; storedTruncated: boolean };
+  promptRef?: { attempt: number; sha256: string; truncated: boolean; originalBytes: number };
+  /** References that were cut when injected into this step's prompt, for later display. */
+  truncatedRefs?: string[];
+  approval?: { by: 'user'; at: string; contentHash: string; approvedHead?: string; approvedBranch?: string; approvedDraftHash?: string; approvedTarget?: { remote: string; url: string; fingerprint: string } };
+  approvalPreview?: { content: string; contentHash: string; approvedHead?: string; approvedBranch?: string; approvedDraftHash?: string; approvedTarget?: { remote: string; url: string; fingerprint: string } };
+  reason?: string;
+  manualCompletion?: { by: 'user'; at: string };
 }

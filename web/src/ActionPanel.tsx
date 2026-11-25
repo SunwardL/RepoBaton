@@ -21,6 +21,7 @@ export function ActionPanel({ projectId, run, executing, onChanged, notify }: Pr
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState('');
   const [guidance, setGuidance] = useState('');
+  const [cleanupPreview, setCleanupPreview] = useState<{ files: string[]; unreferencedHead?: string; confirmationHash: string } | null>(null);
 
   const act = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
     setBusy(true);
@@ -40,6 +41,19 @@ export function ActionPanel({ projectId, run, executing, onChanged, notify }: Pr
 
   const s: RunStatus = run.status;
   const blocks: ReactNode[] = [];
+
+  if (run.humanControl && !executing) return <div className="card sec"><h2>人工接管中</h2>
+    <p className="muted">请在工作区完成操作，交还后可查看现场并选择继续。</p>
+    <p className="mono">{run.worktree}</p>
+    <div className="actions"><button className="btn p" disabled={busy} onClick={() => void act('已交还任务', () => api.returnControl(projectId, run.id))}>交还任务</button></div>
+  </div>;
+
+  if (run.handoff && !executing) blocks.push(<div key="handoff" className="card sec"><h2>交还后的工作区</h2>
+    {run.handoff.branchBefore !== undefined && <p>分支：{run.handoff.branchBefore || '游离 HEAD'} → {run.handoff.branchAfter || '游离 HEAD'}</p>}
+    {run.handoff.headBefore && <p className="mono">{run.handoff.headBefore.slice(0, 8)} → {run.handoff.headAfter?.slice(0, 8)}</p>}
+    {run.handoff.status ? <pre className="flow-output">{run.handoff.status}</pre> : <p className="muted">{run.workspaceMode === 'directory' ? '请在项目文件夹中查看改动。' : '没有未提交的改动。'}</p>}
+    {run.handoff.reviewRequired && <p>请先恢复任务分支，处理未提交改动或已发生的远端操作，再重新接管并交还以核对。</p>}
+  </div>);
 
   if (s === 'awaiting-plan-approval' && !executing) {
     blocks.push(
@@ -66,7 +80,7 @@ export function ActionPanel({ projectId, run, executing, onChanged, notify }: Pr
     );
   }
 
-  if (s === 'interrupted' && !executing) {
+  if (s === 'interrupted' && !executing && !run.flow) {
     const unsafe = !!run.publish.inFlight;
     blocks.push(
       <div key="int" className="card sec">
@@ -84,7 +98,7 @@ export function ActionPanel({ projectId, run, executing, onChanged, notify }: Pr
     );
   }
 
-  if ((s === 'failed' || s === 'needs-human' || s === 'cancelled') && !executing) {
+  if ((s === 'failed' || s === 'needs-human' || s === 'cancelled') && !executing && !run.flow) {
     const unsafe = !!run.publish.inFlight;
     blocks.push(
       <div key="stop" className="card sec">
@@ -118,6 +132,18 @@ export function ActionPanel({ projectId, run, executing, onChanged, notify }: Pr
     );
   }
 
+  if (run.flow && ['failed', 'needs-human', 'cancelled', 'interrupted'].includes(s) && !executing) {
+    const first = run.flow.workflow.steps.find((step) => run.steps?.[step.id]?.status !== 'succeeded');
+    const canResume = !first || (first.type !== 'approval' && run.steps?.[first.id]?.status === 'pending');
+    const last = run.flow.workflow.steps.at(-1);
+    const confirmation = last?.type === 'approval' ? run.steps?.[last.id]?.approval : undefined;
+    const canReviewAgain = !!confirmation && !!run.flow.workflow.git.publish?.push && !run.publish.inFlight && !run.publish.pushed && !run.publish.prUrl && !run.publish.merged && !run.publish.tag && !run.publish.pendingTag;
+    blocks.push(<div key="custom-stop" className="card sec"><h2>流程已停止</h2><p>{run.error ?? '请检查步骤状态和工作区。'}</p><p className="muted">工作区已保留，可查看步骤输出和改动。</p>
+      {run.publish.inFlight ? <CheckRemote projectId={projectId} runId={run.id} op={run.publish.inFlight} branch={run.branch} onDone={onChanged} notify={notify} /> :
+        <div className="actions">{canResume && <button className="btn p" disabled={busy} onClick={() => void act('已继续执行', () => api.resume(projectId, run.id, s))}>继续执行</button>}
+          {canReviewAgain && <button className="btn" disabled={busy} onClick={() => void act('请重新审阅发布内容', () => api.reviewPublicationAgain(projectId, run.id, confirmation.contentHash))}>重新审阅发布</button>}</div>}</div>);
+  }
+
   if (executing) {
     blocks.push(
       <div key="exec" className="card sec">
@@ -138,22 +164,32 @@ export function ActionPanel({ projectId, run, executing, onChanged, notify }: Pr
     );
   }
 
-  const canClean = !executing && s !== 'running' && s !== 'awaiting-plan-approval' && run.worktree;
+  const canClean = !executing && s !== 'running' && s !== 'awaiting-plan-approval' && run.worktree && run.workspaceMode !== 'directory';
+  if (!executing && s !== 'running' && run.worktree) blocks.push(<div key="takeover" className="card sec"><h2>人工接管</h2>
+    <p className="muted">在原生会话或工作区处理后，再交还任务。</p>
+    <button className="btn" disabled={busy} onClick={() => void act('已进入人工接管', () => api.takeover(projectId, run.id))}>接管任务</button></div>);
   if (canClean) {
     blocks.push(
       <div key="clean" className="card sec">
         <h2>清理</h2>
-        <p className="muted">只删除这个任务的工作区目录,分支和提交会保留。</p>
+        <p className="muted">先检查工作区内容，再决定是否清理。</p>
+        {cleanupPreview && <div>
+          {cleanupPreview.files.length ? <><p>清理会丢弃以下文件或目录中的改动：</p><pre className="flow-output">{cleanupPreview.files.join('\n')}</pre></> : <p className="muted">没有未提交或忽略的文件。</p>}
+          {cleanupPreview.unreferencedHead && <p>此提交没有分支或标签引用：<code>{cleanupPreview.unreferencedHead}</code></p>}
+        </div>}
         <div className="actions">
-          <button
-            className="btn"
-            disabled={busy}
-            onClick={() => {
-              if (window.confirm('删除这个任务的工作区目录?分支和提交会保留。')) void act('工作区已清理', () => api.cleanup(projectId, run.id));
-            }}
-          >
-            清理工作区
-          </button>
+          {!cleanupPreview ? <button className="btn" disabled={busy} onClick={() => {
+            setBusy(true);
+            void api.cleanupPreview(projectId, run.id).then(setCleanupPreview).catch((error) => notify(errorText(error), 'err')).finally(() => setBusy(false));
+          }}>检查清理内容</button> : <>
+            <button className="btn" disabled={busy} onClick={() => {
+              const losesData = cleanupPreview.files.length > 0 || !!cleanupPreview.unreferencedHead;
+              if (window.confirm(losesData ? '确认丢弃上面列出的内容并清理工作区？' : '确认清理这个任务的工作区？')) {
+                void act('工作区已清理', () => api.cleanup(projectId, run.id, losesData ? cleanupPreview.confirmationHash : undefined));
+              }
+            }}>{cleanupPreview.files.length || cleanupPreview.unreferencedHead ? '丢弃并清理' : '清理工作区'}</button>
+            <button className="btn" disabled={busy} onClick={() => setCleanupPreview(null)}>取消</button>
+          </>}
         </div>
       </div>,
     );

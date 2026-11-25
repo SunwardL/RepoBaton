@@ -121,7 +121,7 @@ test('cleanup: refuses executing and running runs, removes only worktrees inside
   const repo = await makeRepo();
   const store = new RunStore(repo);
   const wtDir = path.join(repo, '.repobaton', 'worktrees', 'done');
-  await fs.mkdir(wtDir, { recursive: true });
+  await git(repo, ['worktree', 'add', '-b', 'repobaton/done', wtDir, 'HEAD']);
   await store.save(stateOf({ id: 'done', status: 'succeeded', worktree: wtDir, branch: 'repobaton/done' }));
   await store.save(stateOf({ id: 'busy', status: 'interrupted', worktree: wtDir }));
   await store.save(stateOf({ id: 'live', status: 'running' }));
@@ -228,7 +228,8 @@ test('server restart: an orphaned run shows as interrupted, keeps its work, and 
   const first = await bootServer(repo, regFile, 'server-one');
   const store = new RunStore((await new ProjectRegistry(regFile).list())[0].root);
   const wt = path.join(store.root, '..', 'worktrees', 'orphan');
-  await fs.mkdir(wt, { recursive: true });
+  await fs.mkdir(path.dirname(wt), { recursive: true });
+  await git(repo, ['worktree', 'add', '-b', 'repobaton/orphan', wt, 'HEAD']);
   await store.save(
     stateOf({
       id: 'orphan',

@@ -1,4 +1,5 @@
 import { resolveApiKey } from '../config.ts';
+import { registerSecret } from '../redact.ts';
 import {
   AgentError,
   type AgentErrorKind,
@@ -101,6 +102,8 @@ abstract class ApiAgent implements Agent {
         'auth',
       );
     }
+    // The user may choose an env name that does not look like a credential name.
+    registerSecret(k);
     return k;
   }
 

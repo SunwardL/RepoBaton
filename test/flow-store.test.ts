@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { MAX_INJECT_HARD, readStepOutput, stepDir, writeStepOutput } from '../src/flow-store.ts';
+import { MAX_INJECT_HARD, readStepOutput, readStepPrompt, stepDir, writeStepOutput, writeStepPrompt } from '../src/flow-store.ts';
 import { renderPrompt } from '../src/flow-render.ts';
 
 async function runDir(): Promise<string> {
@@ -45,6 +45,24 @@ test('secrets are removed before anything reaches disk', async () => {
   } finally {
     delete process.env.RB_STEP_TEST_API_KEY;
   }
+});
+
+test('rendered prompt records are masked, bounded and checked for tampering', async () => {
+  const run = await runDir();
+  process.env.RB_PROMPT_TEST_TOKEN = 'prompt-secret-value-123456';
+  try {
+    const ref = await writeStepPrompt(run, 's', 1, `start prompt-secret-value-123456 ${'中'.repeat(MAX_INJECT_HARD)}`);
+    assert.equal(ref.truncated, true);
+    const text = await readStepPrompt(run, 's', ref);
+    assert.doesNotMatch(text, /prompt-secret-value-123456/);
+    assert.match(text, /\[redacted\]/);
+    assert.ok(Buffer.byteLength(text) <= MAX_INJECT_HARD + 200);
+    assert.doesNotMatch(text, /�/);
+    await fs.writeFile(path.join(run, 'steps', 's', 'prompt-1.txt'), 'tampered');
+    await assert.rejects(readStepPrompt(run, 's', ref), /corrupt/);
+    await assert.rejects(writeStepPrompt(run, '../bad', 1, 'x'));
+    await assert.rejects(writeStepPrompt(run, 's', -1, 'x'));
+  } finally { delete process.env.RB_PROMPT_TEST_TOKEN; }
 });
 
 test('a secret that straddles the storage cut is masked, not half-exposed', async () => {

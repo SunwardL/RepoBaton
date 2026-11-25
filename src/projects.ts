@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { identifyRepo } from './repoid.ts';
+import { identifyProject } from './repoid.ts';
 import { exists, nowIso, readJson, writeJson } from './util.ts';
 
 export interface ProjectEntry {
@@ -15,8 +15,10 @@ export interface ProjectEntry {
 
 interface ProjectFile {
   version: 1;
-  projects: Omit<ProjectEntry, 'id'>[];
+  projects: (Omit<ProjectEntry, 'id'> & { id?: string })[];
 }
+
+const VALID_PROJECT_ID = /^[0-9a-z]{7}$/;
 
 /** Per-user config dir: %APPDATA%\repobaton on Windows, XDG/home elsewhere. */
 export function userDataDir(): string {
@@ -56,23 +58,29 @@ export class ProjectRegistry {
       // Re-derive the identity: the folder may have moved, or been given a new casing.
       let key: string;
       try {
-        key = (await identifyRepo(p.root)).key;
+        key = (await identifyProject(p.root)).key;
       } catch {
         // Keep entries whose folder is currently missing so the UI can show them as unavailable.
         key = `missing:${p.root.toLowerCase()}`;
       }
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ id: idForKey(key), name: p.name, root: p.root, addedAt: p.addedAt });
+      out.push({ id: typeof p.id === 'string' && VALID_PROJECT_ID.test(p.id) ? p.id : idForKey(key), name: p.name, root: p.root, addedAt: p.addedAt });
     }
     return out;
   }
 
   /** Add the repository containing `dir` (any subdirectory or linked worktree works). Idempotent. */
   async add(dir: string, name?: string): Promise<ProjectEntry> {
-    const id = await identifyRepo(dir); // throws NotAGitRepoError
+    const id = await identifyProject(dir);
     return this.mutate(async (all) => {
-      const existing = all.find((p) => p.id === idForKey(id.key));
+      let existing: ProjectEntry | undefined;
+      for (const project of all) {
+        if ((await identifyProject(project.root).catch(() => undefined))?.key === id.key) {
+          existing = project;
+          break;
+        }
+      }
       if (existing) return { next: all, result: existing };
       const entry: ProjectEntry = {
         id: idForKey(id.key),
@@ -95,11 +103,20 @@ export class ProjectRegistry {
     return (await this.list()).find((p) => p.id === id);
   }
 
+  /** Persist legacy derived IDs before a project can change its Git identity. */
+  async stabilize(): Promise<void> {
+    if (!(await exists(this.file))) return;
+    let data: ProjectFile;
+    try { data = await readJson<ProjectFile>(this.file); } catch { return; }
+    if (!Array.isArray(data.projects) || data.projects.every((p) => typeof p?.id === 'string' && VALID_PROJECT_ID.test(p.id))) return;
+    await this.mutate(async (all) => ({ next: all, result: undefined }));
+  }
+
   /** Read, change and write under one lock, so concurrent callers cannot overwrite each other. */
   private mutate<T>(fn: (all: ProjectEntry[]) => Promise<{ next: ProjectEntry[]; result: T }>): Promise<T> {
     const run = this.writing.then(async () => {
       const { next, result } = await fn(await this.list());
-      const body: ProjectFile = { version: 1, projects: next.map(({ name, root, addedAt }) => ({ name, root, addedAt })) };
+      const body: ProjectFile = { version: 1, projects: next.map(({ id, name, root, addedAt }) => ({ id, name, root, addedAt })) };
       await fs.mkdir(path.dirname(this.file), { recursive: true });
       await writeJson(this.file, body);
       return result;

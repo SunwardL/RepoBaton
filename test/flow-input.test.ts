@@ -47,7 +47,9 @@ test('git.publish of the wrong type or with unknown or non-boolean flags is an e
     const w = base([agent('a')], { mode: 'explicit-step', publish });
     assert.ok(has(check(w), 'publish'), JSON.stringify(publish));
   }
-  assert.deepEqual(check(base([agent('a')], { mode: 'explicit-step', publish: { push: true, tagPrefix: 'v', remote: 'origin' } })), []);
+  assert.deepEqual(check(base([agent('a'), { id: 'save', title: 'save', type: 'commit', message: 'save' },
+    { id: 'approve', title: 'approve', type: 'approval', show: [{ kind: 'task' }] }],
+  { mode: 'explicit-step', publish: { push: true, tagPrefix: 'v', remote: 'origin' } })), []);
 });
 
 test('step entries and optional fields of the wrong type are errors, never ignored', () => {

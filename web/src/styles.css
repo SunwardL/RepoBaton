@@ -112,6 +112,10 @@ h1 { font-size: 24px; letter-spacing: -.3px; line-height: 1.25; }
 .settings-agent code { display: block; font-size: 11px; overflow-wrap: anywhere; margin-top: 6px; color: var(--ink2); }
 .settings-check-note { margin-top: 8px; font-size: 12px; }
 .global-agents-link { font-weight: 650; }
+.project-entry { display: flex; align-items: center; }
+.project-entry .pitem { flex: 1; min-width: 0; }
+.project-remove { border: 0; background: transparent; color: inherit; opacity: .65; cursor: pointer; font-size: 18px; padding: 4px 8px; }
+.project-remove:hover { opacity: 1; }
 .global-agent-list { display: grid; gap: 12px; margin-top: 14px; }
 .global-agent { border: 1px solid var(--line); padding: 14px; border-radius: 9px; background: var(--bg); }
 .global-agent-detail { margin-top: 5px; overflow-wrap: anywhere; }
@@ -124,6 +128,31 @@ h1 { font-size: 24px; letter-spacing: -.3px; line-height: 1.25; }
 .agent-import input[type=file] { width: fit-content; max-width: 100%; }
 .global-agent-footer { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
 .task-workflow { margin-top: 16px; }
+.flow-mode { display: flex; gap: 8px; margin: 18px 0; }
+.flow-editor { margin: 18px 0; }
+.flow-heading { margin-bottom: 14px; }
+.flow-heading p { margin-top: 6px; font-size: 13px; }
+.flow-step { position: relative; margin: 0 0 10px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--sf); }
+.flow-step-head { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+.flow-step-head .project-actions { margin-left: auto; }
+.flow-step-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ac); }
+.flow-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr)); gap: 10px; margin-top: 12px; }
+.flow-full { display: block; margin-top: 10px; }
+.flow-full textarea { min-height: 92px; resize: vertical; }
+.flow-add { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.flow-note { font-size: 12px; margin-top: 10px; }
+.flow-inputs { margin-top: 14px; }
+.flow-inputs p { margin: 5px 0; font-size: 12px; }
+.flow-input-option { display: flex; align-items: center; gap: 7px; margin-top: 6px; }
+.flow-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.flow-import { position: relative; overflow: hidden; cursor: pointer; }
+.flow-import input { position: absolute; inset: 0; opacity: 0; width: 100%; cursor: pointer; }
+.flow-preview { border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin: 12px 0; }
+.flow-preview p { margin-top: 8px; overflow-wrap: anywhere; }
+.custom-run-step { display: flex; justify-content: space-between; align-items: start; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line2); }
+.custom-run-step p { margin-top: 5px; }
+.custom-worktree { margin-top: 12px; overflow-wrap: anywhere; }
+.flow-output { margin: 10px 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; font-size: 12px; }
 .task-workflow h3 { font-size: 14px; }
 .task-workflow p { margin-top: 8px; }
 .run-workflow { display: flex; flex-wrap: wrap; gap: 6px; margin: -5px 0 14px; }

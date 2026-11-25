@@ -407,17 +407,8 @@ async function cmdUi(f: Flags): Promise<number> {
   const port = typeof f.port === 'string' ? Number(f.port) : undefined;
   if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) fail('--port must be 0-65535');
   const explicit = Array.isArray(f.project) ? f.project.filter((x): x is string => typeof x === 'string') : [];
-  // Open the current directory's repository too, when there is one, so "repobaton ui" in a project just works.
-  const projects = [...explicit];
-  if (!explicit.length) {
-    try {
-      projects.push(await G.repoRoot(process.cwd()));
-    } catch {
-      /* not inside a repository: the project list on disk is enough */
-    }
-  }
   const { runUi } = await import('./ui.ts');
-  const server = await runUi({ port, projects, open: !f['no-open'] }).catch((e: Error) => fail(e.message, 1));
+  const server = await runUi({ port, projects: explicit, open: !f['no-open'] }).catch((e: Error) => fail(e.message, 1));
   await new Promise<void>((resolve) => {
     const stop = (): void => resolve();
     process.once('SIGINT', stop);

@@ -39,6 +39,20 @@ export async function git(cwd: string, args: string[], opts: GitOptions = {}): P
   return r.stdout;
 }
 
+/** Do not start or automatically confirm a commit while another Git operation may own the index. */
+export async function unfinishedGitOperation(cwd: string): Promise<string | undefined> {
+  for (const marker of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'index.lock']) {
+    const markerPath = (await git(cwd, ['rev-parse', '--git-path', marker])).trim();
+    if (!markerPath) throw new Error('cannot locate Git operation marker');
+    const present = await fs.lstat(path.resolve(cwd, markerPath)).then(() => true, (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    });
+    if (present) return marker;
+  }
+  return undefined;
+}
+
 export async function repoRoot(cwd: string): Promise<string> {
   const out = await git(cwd, ['rev-parse', '--show-toplevel']);
   return path.resolve(out.trim());
@@ -132,7 +146,7 @@ export async function addWorktree(root: string, dir: string, branch: string, bas
 }
 
 export async function removeWorktree(root: string, dir: string): Promise<void> {
-  await git(root, ['worktree', 'remove', '--force', dir], { allowFail: true });
+  if (await exists(dir)) await git(root, ['worktree', 'remove', '--force', dir]);
   await git(root, ['worktree', 'prune'], { allowFail: true });
 }
 

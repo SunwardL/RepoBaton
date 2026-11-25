@@ -100,16 +100,16 @@ export function RoundCard({ round, active }: { round: Round; active: boolean }) 
 }
 
 export function DiffView({ diff, stat, truncated }: { diff: string; stat: string; truncated?: boolean }) {
-  if (!diff) return <div className="empty"><h3>没有可显示的改动</h3>实现阶段完成后会出现。</div>;
+  if (!diff && !stat.trim()) return <div className="empty"><h3>没有可显示的改动</h3>实现阶段完成后会出现。</div>;
   return (
     <>
       {stat ? <pre className="mono muted" style={{ marginBottom: 10, whiteSpace: 'pre-wrap' }}>{stat.trim()}</pre> : null}
-      <div className="diff" role="region" aria-label="代码改动">
+      {diff ? <div className="diff" role="region" aria-label="代码改动">
         {diff.split('\n').map((l, i) => {
           const cls = l.startsWith('diff --git') ? 'f' : l.startsWith('@@') ? 'h' : l.startsWith('+') && !l.startsWith('+++') ? 'a' : l.startsWith('-') && !l.startsWith('---') ? 'r' : '';
           return <div key={i} className={cls}>{l || ' '}</div>;
         })}
-      </div>
+      </div> : <p className="muted">未跟踪文件的内容请在工作区查看。</p>}
       {truncated ? <p className="muted" style={{ marginTop: 8 }}>改动过大,只显示了前一部分。</p> : null}
     </>
   );

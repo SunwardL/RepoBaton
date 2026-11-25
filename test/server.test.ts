@@ -135,7 +135,7 @@ interface Harness {
 
 async function harness(
   repos: string[],
-  o: { serverId?: string; registryFile?: string; probe?: (pid: number) => Promise<{ alive: boolean; startedAt?: number }>; skipRecovery?: boolean } = {},
+  o: { serverId?: string; registryFile?: string; probe?: (pid: number) => Promise<{ alive: boolean; startedAt?: number }>; skipRecovery?: boolean; openDirectory?: (dir: string) => Promise<void> } = {},
 ): Promise<Harness> {
   const regFile = o.registryFile ?? path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'rb-home-')), 'projects.json');
   const registry = new ProjectRegistry(regFile);
@@ -165,6 +165,7 @@ async function harness(
     serverId: o.serverId,
     probe: o.probe,
     skipRecovery: o.skipRecovery,
+    openDirectory: o.openDirectory,
     makePipeline: (ctx) => new Pipeline({ repo: ctx.repoRoot, config: ctx.config, registry: agentRegistry, signal: ctx.signal, owner: ctx.owner }),
   });
   const call: Harness['call'] = (method, p, body, headers) =>
@@ -375,11 +376,509 @@ test('projects: add by path (subfolder or worktree resolves to the repository), 
     assert.equal(again.json.project.id, added.json.project.id, 'same repository, same project');
     assert.equal((await h.call('GET', '/api/projects')).json.projects.length, 1);
     const notRepo = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-plain-'));
-    assert.equal((await h.call('POST', '/api/projects', { path: notRepo })).json.error.code, 'not-a-repo');
+    const plain = await h.call('POST', '/api/projects', { path: notRepo });
+    assert.equal(plain.status, 201);
+    assert.equal(plain.json.project.isGit, false);
+    assert.equal(plain.json.project.available, true);
     assert.equal((await h.call('POST', '/api/projects', {})).status, 400);
   } finally {
     await h.close();
   }
+});
+
+test('an ordinary directory runs a custom flow in place without Git', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-plain-flow-'));
+  await fs.writeFile(path.join(dir, 'value.txt'), 'old\n');
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'plain', git: { mode: 'none' }, steps: [
+      { id: 'write', title: 'write', type: 'agent', agent: 'codex', access: 'workspace-write', prompt: 'IMPLEMENTER {{task}}', output: { kind: 'text' } },
+    ] };
+    const started = await h.call('POST', runsPath(pid), { task: 'edit the file', flow });
+    assert.equal(started.status, 202, JSON.stringify(started.json));
+    const id = started.json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal(await fs.readFile(path.join(dir, 'value.txt'), 'utf8'), 'good\n');
+    const run = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(run.workspaceMode, 'directory');
+    const promptPath = runsPath(pid, id, '/steps/write/prompt');
+    const recorded = await h.call('GET', promptPath);
+    assert.equal(recorded.status, 200);
+    assert.match(recorded.json.prompt, /edit the file/);
+    await fs.writeFile(path.join(dir, '.repobaton', 'runs', id, 'steps', 'write', `prompt-${recorded.json.attempt}.txt`), 'tampered');
+    assert.equal((await h.call('GET', promptPath)).status, 409);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/cleanup'), {})).status, 409);
+    assert.equal(await fs.readFile(path.join(dir, 'value.txt'), 'utf8'), 'good\n');
+    await assert.rejects(fs.stat(path.join(dir, '.git')));
+    const commit = { ...flow, git: { mode: 'explicit-step' }, steps: [{ id: 'commit', title: 'commit', type: 'commit', message: 'save' }] };
+    assert.equal((await h.call('POST', runsPath(pid), { task: 'commit', flow: commit })).status, 422);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a Git directory without commits can run without a worktree', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-empty-git-'));
+  await git(dir, ['init', '-q', '-b', 'main']);
+  await fs.writeFile(path.join(dir, 'value.txt'), 'old\n');
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const project = (await h.call('GET', '/api/projects')).json.projects[0];
+    assert.equal(project.isGit, true);
+    assert.equal(project.hasCommits, false);
+    const flow = { schema: 1, kind: 'custom', name: 'no commits', git: { mode: 'none' }, steps: [
+      { id: 'write', title: 'write', type: 'agent', agent: 'codex', access: 'workspace-write', prompt: 'IMPLEMENTER {{task}}', output: { kind: 'text' } },
+    ] };
+    const started = await h.call('POST', runsPath(pid), { task: 'edit the file', flow });
+    assert.equal(started.status, 202, JSON.stringify(started.json));
+    await waitFor(async () => (await statusOf(h, pid, started.json.id)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal(await fs.readFile(path.join(dir, 'value.txt'), 'utf8'), 'good\n');
+    assert.equal((await h.call('GET', runsPath(pid, started.json.id))).json.run.workspaceMode, 'directory');
+  } finally {
+    await h.close();
+  }
+});
+
+test('custom flow approval binds the displayed content and only continues once', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-approval-flow-'));
+  await fs.writeFile(path.join(dir, 'notes.txt'), 'first version');
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'approval', git: { mode: 'none' }, steps: [
+      { id: 'confirm', title: 'confirm', type: 'approval', show: [{ kind: 'task' }, { kind: 'file', path: 'notes.txt' }] },
+      { id: 'write', title: 'write', type: 'agent', agent: 'codex', access: 'workspace-write', prompt: 'IMPLEMENTER {{task}}', output: { kind: 'text' } },
+    ] };
+    const started = await h.call('POST', runsPath(pid), { task: 'write', flow });
+    assert.equal(started.status, 202, JSON.stringify(started.json));
+    const id = started.json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'needs-human' && await idle(h, pid), 45000);
+    const initial = (await h.call('GET', runsPath(pid, id))).json.run.steps.confirm.approvalPreview;
+    assert.match(initial.content, /first version/);
+    assert.match(initial.content, /write/);
+    await fs.writeFile(path.join(dir, 'notes.txt'), 'second version');
+    assert.equal((await h.call('POST', runsPath(pid, id, '/flow-approve'), { stepId: 'confirm', contentHash: initial.contentHash })).status, 409);
+    assert.equal(h.agent.calls.length, 0);
+    const updated = (await h.call('GET', runsPath(pid, id))).json.run.steps.confirm.approvalPreview;
+    assert.match(updated.content, /second version/);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/flow-approve'), { stepId: 'confirm', contentHash: updated.contentHash })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal(h.agent.calls.length, 1);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/flow-approve'), { stepId: 'confirm', contentHash: updated.contentHash })).status, 409);
+  } finally {
+    await h.close();
+  }
+});
+
+test('workflow YAML is previewed before saving and stale saves are rejected', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-flow-library-'));
+  const h = await harness([dir]);
+  const endpoint = `/api/projects/${h.projectIds[0]}/flow`;
+  try {
+    const initial = await h.call('GET', endpoint);
+    assert.equal(initial.json.flow, null);
+    const yaml = ['schema: 1', 'kind: custom', 'name: Demo', 'git: { mode: none }', 'steps:',
+      '  - id: plan', '    title: Plan', '    type: agent', '    agent: codex', '    access: read-only', '    prompt: "{{task}}"', '    output: { kind: text }'].join('\n');
+    const preview = await h.call('POST', endpoint + '/preview', { yaml });
+    assert.equal(preview.status, 200);
+    assert.equal((await h.call('GET', endpoint)).json.flow, null);
+    const saved = await h.call('PUT', endpoint, { revision: initial.json.revision, flow: preview.json.flow });
+    assert.equal(saved.status, 200);
+    assert.equal((await h.call('GET', endpoint)).json.flow.name, 'Demo');
+    assert.equal((await h.call('PUT', endpoint, { revision: initial.json.revision, flow: preview.json.flow })).status, 409);
+    const exported = await h.call('POST', endpoint + '/export', { flow: saved.json.flow });
+    assert.match(exported.json.yaml, /name: Demo/);
+    assert.equal((await h.call('POST', endpoint + '/preview', { yaml: 'broken: [' })).status, 422);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a command workflow must match the preview confirmed at start', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-command-confirm-'));
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'commands', git: { mode: 'none' }, steps: [
+      { id: 'check', title: 'check', type: 'command', run: 'echo safe', output: { kind: 'text' } },
+    ] };
+    assert.equal((await h.call('POST', runsPath(pid), { task: 'check', flow })).status, 409);
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    assert.equal(preview.status, 200);
+    assert.equal(preview.json.flow.steps[0].run, 'echo safe');
+    assert.equal(preview.json.workspaceMode, 'directory');
+    assert.ok(preview.json.shell, 'the preview names the shell used for command steps');
+    const changed = { ...flow, steps: [{ ...flow.steps[0], run: 'echo changed' }] };
+    assert.equal((await h.call('POST', runsPath(pid), { task: 'check', flow: changed, confirmedWorkflowHash: preview.json.hash })).status, 409);
+    const started = await h.call('POST', runsPath(pid), { task: 'check', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(started.status, 202, JSON.stringify(started.json));
+    await waitFor(async () => (await statusOf(h, pid, started.json.id)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal((await h.call('GET', runsPath(pid, started.json.id))).json.run.flow.startConfirmation.hash, preview.json.hash);
+  } finally { await h.close(); }
+});
+
+test('start preview becomes stale if a directory becomes a committed Git project', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-workspace-confirm-'));
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'commands', git: { mode: 'none' }, steps: [
+      { id: 'check', title: 'check', type: 'command', run: 'echo safe', output: { kind: 'text' } },
+    ] };
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    assert.equal(preview.json.workspaceMode, 'directory');
+    await git(dir, ['init', '-q', '-b', 'main']);
+    await git(dir, ['config', 'user.email', 'test@example.invalid']);
+    await git(dir, ['config', 'user.name', 'Test']);
+    await fs.writeFile(path.join(dir, 'file.txt'), 'initial');
+    await git(dir, ['add', 'file.txt']);
+    await git(dir, ['commit', '-q', '-m', 'initial']);
+    const result = await h.call('POST', runsPath(pid), { task: 'check', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(result.status, 409);
+    assert.equal(result.json.error.code, 'confirmation-required');
+    assert.equal((await h.call('GET', runsPath(pid))).json.runs.length, 0);
+  } finally { await h.close(); }
+});
+
+test('start preview becomes stale when an agent command changes', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-agent-confirm-'));
+  const config = (command: string) => ['agents:', `  a: { type: command, command: ${command} }`, 'stages:',
+    '  plan: { agent: a }', '  implement: { agent: a }', '  review: { agent: a }', '  release: { agent: a }', ''].join('\n');
+  await fs.writeFile(path.join(dir, 'repobaton.yaml'), config('original'));
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'agent', git: { mode: 'none' }, steps: [
+      { id: 'agent', title: 'agent', type: 'agent', agent: 'a', access: 'read-only', prompt: '{{task}}', output: { kind: 'text' } },
+    ] };
+    assert.equal((await h.call('POST', runsPath(pid), { task: 'check', flow })).status, 409);
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    assert.equal(preview.status, 200);
+    assert.equal(preview.json.agents.a.command, 'original');
+    await fs.writeFile(path.join(dir, 'repobaton.yaml'), config('changed'));
+    const result = await h.call('POST', runsPath(pid), { task: 'check', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(result.status, 409);
+    assert.equal(result.json.error.code, 'confirmation-required');
+    assert.equal((await h.call('GET', runsPath(pid))).json.runs.length, 0);
+  } finally { await h.close(); }
+});
+
+test('fallback command is visible in the start preview and bound to confirmation', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-fallback-confirm-'));
+  const config = (command: string) => ['agents:', '  a: { type: codex-cli }', `  b: { type: command, command: ${command} }`, 'stages:',
+    '  plan: { agent: a }', '  implement: { agent: a }', '  review: { agent: a }', '  release: { agent: a }', ''].join('\n');
+  await fs.writeFile(path.join(dir, 'repobaton.yaml'), config('original'));
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'agent', git: { mode: 'none' }, steps: [
+      { id: 'agent', title: 'agent', type: 'agent', agent: 'a', fallbackAgent: 'b', access: 'read-only', prompt: '{{task}}', output: { kind: 'text' } },
+    ] };
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    assert.equal(preview.status, 200, JSON.stringify(preview.json));
+    assert.equal(preview.json.agents.b.command, 'original');
+    assert.equal((await h.call('POST', runsPath(pid), { task: 'check', flow })).status, 409);
+    await fs.writeFile(path.join(dir, 'repobaton.yaml'), config('changed'));
+    const result = await h.call('POST', runsPath(pid), { task: 'check', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(result.status, 409);
+    assert.equal(result.json.error.code, 'confirmation-required');
+  } finally { await h.close(); }
+});
+
+test('agent argument changes invalidate confirmation without exposing argument values', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-argument-confirm-'));
+  const priorHome = process.env.REPOBATON_HOME;
+  process.env.REPOBATON_HOME = path.join(dir, 'settings');
+  const config = (value: string) => ['agents:', `  a: { type: command, command: node, args: ["--header", "${value}"] }`, 'stages:',
+    '  plan: { agent: a }', '  implement: { agent: a }', '  review: { agent: a }', '  release: { agent: a }', ''].join('\n');
+  await fs.writeFile(path.join(dir, 'repobaton.yaml'), config('private-header-value'));
+  let h: Harness | undefined;
+  try {
+    h = await harness([dir]);
+    const [pid] = h.projectIds;
+    const flow = { schema: 1, kind: 'custom', name: 'agent', git: { mode: 'none' }, steps: [
+      { id: 'agent', title: 'agent', type: 'agent', agent: 'a', access: 'read-only', prompt: '{{task}}', output: { kind: 'text' } },
+    ] };
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    assert.equal(preview.status, 200, JSON.stringify(preview.json));
+    assert.equal(preview.json.agents.a.hasArguments, true);
+    assert.doesNotMatch(JSON.stringify(preview.json), /private-header-value/);
+    await fs.writeFile(path.join(dir, 'repobaton.yaml'), config('different-private-value'));
+    const result = await h.call('POST', runsPath(pid), { task: 'check', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(result.status, 409);
+    assert.equal(result.json.error.code, 'confirmation-required');
+    assert.doesNotMatch(JSON.stringify(result.json), /private-header-value|different-private-value/);
+  } finally {
+    await h?.close();
+    if (priorHome === undefined) delete process.env.REPOBATON_HOME;
+    else process.env.REPOBATON_HOME = priorHome;
+  }
+});
+
+test('human takeover blocks continuation and protects a shared ordinary directory', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-flow-takeover-'));
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'human', git: { mode: 'none' }, steps: [
+      { id: 'confirm', title: 'confirm', type: 'approval', show: [{ kind: 'task' }] },
+      { id: 'write', title: 'write', type: 'agent', agent: 'codex', access: 'workspace-write', prompt: 'IMPLEMENTER {{task}}', output: { kind: 'text' } },
+    ] };
+    const id = (await h.call('POST', runsPath(pid), { task: 'work', flow })).json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'needs-human' && await idle(h, pid), 45000);
+    const preview = (await h.call('GET', runsPath(pid, id))).json.run.steps.confirm.approvalPreview;
+    const other = (await h.call('POST', runsPath(pid), { task: 'other paused run', flow })).json.id;
+    await waitFor(async () => (await statusOf(h, pid, other)) === 'needs-human' && await idle(h, pid), 45000);
+    const otherPreview = (await h.call('GET', runsPath(pid, other))).json.run.steps.confirm.approvalPreview;
+    assert.equal((await h.call('POST', runsPath(pid, id, '/takeover'), {})).status, 200);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/flow-approve'), { stepId: 'confirm', contentHash: preview.contentHash })).status, 409);
+    assert.equal((await h.call('POST', runsPath(pid), { task: 'another', flow })).status, 409);
+    assert.equal((await h.call('POST', runsPath(pid, other, '/takeover'), {})).status, 409);
+    assert.equal((await h.call('POST', runsPath(pid, other, '/flow-approve'), { stepId: 'confirm', contentHash: otherPreview.contentHash })).status, 409);
+    assert.equal(h.agent.calls.length, 0);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/return-control'), {})).status, 200);
+    assert.equal((await h.call('POST', runsPath(pid, other, '/flow-approve'), { stepId: 'confirm', contentHash: otherPreview.contentHash })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, other)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/flow-approve'), { stepId: 'confirm', contentHash: preview.contentHash })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+  } finally { await h.close(); }
+});
+
+test('opening a workspace uses the recorded directory and rejects a missing one', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-open-workspace-'));
+  const opened: string[] = [];
+  const h = await harness([dir], { openDirectory: async (target) => { opened.push(target); } });
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'open', git: { mode: 'none' }, steps: [
+      { id: 'confirm', title: 'confirm', type: 'approval', show: [{ kind: 'task' }] },
+    ] };
+    const started = await h.call('POST', runsPath(pid), { task: 'work', flow });
+    const id = started.json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'needs-human' && await idle(h, pid), 45000);
+    const actual = (await h.call('GET', runsPath(pid, id))).json.run.worktree;
+    assert.equal((await h.call('POST', runsPath(pid, id, '/open-workspace'), { path: 'C:\\not-the-workspace' })).status, 200);
+    assert.deepEqual(opened, [actual]);
+    const stateFile = path.join(dir, '.repobaton', 'runs', id, 'state.json');
+    const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    state.worktree = path.join(dir, 'missing');
+    await fs.writeFile(stateFile, JSON.stringify(state));
+    assert.equal((await h.call('POST', runsPath(pid, id, '/open-workspace'), {})).status, 409);
+    assert.deepEqual(opened, [actual]);
+  } finally { await h.close(); }
+});
+
+test('API confirms an interrupted command result without running it again', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-flow-confirm-'));
+  const h = await harness([dir]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'confirm', git: { mode: 'none' }, steps: [
+      { id: 'command', title: 'command', type: 'command', run: 'node -e "setTimeout(()=>{},5000)"', timeoutSec: 1, output: { kind: 'text' } },
+      { id: 'confirm', title: 'confirm', type: 'approval', show: [{ kind: 'step-output', step: 'command' }] },
+    ] };
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    const started = await h.call('POST', runsPath(pid), { task: 'work', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(started.status, 202);
+    const id = started.json.id;
+    await waitFor(async () => (await h.call('GET', runsPath(pid, id))).json.run.steps.command.status === 'unknown' && await idle(h, pid), 45000);
+    const before = (await h.call('GET', runsPath(pid, id))).json.run.steps.command;
+    assert.equal((await h.call('POST', runsPath(pid, id, '/flow-complete-unknown'), { stepId: 'command', attempt: before.attempt + 1, output: 'bad', exitCode: 0 })).status, 409);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/flow-complete-unknown'), { stepId: 'command', attempt: before.attempt, output: 'checked result', exitCode: 0 })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'needs-human' && await idle(h, pid), 45000);
+    const after = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(after.steps.command.attempt, before.attempt);
+    assert.equal(after.steps.command.manualCompletion.by, 'user');
+    assert.match(after.steps.confirm.approvalPreview.content, /checked result/);
+  } finally { await h.close(); }
+});
+
+test('API rechecks an interrupted commit without making another commit', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'commit check', git: { mode: 'explicit-step' }, steps: [
+      { id: 'write', title: 'write', type: 'agent', agent: 'codex', access: 'workspace-write', prompt: 'IMPLEMENTER {{task}}', output: { kind: 'text' } },
+      { id: 'commit', title: 'commit', type: 'commit', message: 'save' },
+    ] };
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    const started = await h.call('POST', runsPath(pid), { task: 'work', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(started.status, 202);
+    const id = started.json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    const file = path.join(repo, '.repobaton', 'runs', id, 'state.json');
+    const state = JSON.parse(await fs.readFile(file, 'utf8'));
+    const head = await git(state.worktree, ['rev-parse', 'HEAD']);
+    state.status = 'interrupted';
+    state.steps.commit.status = 'unknown';
+    await fs.writeFile(file, JSON.stringify(state));
+    const endpoint = runsPath(pid, id, '/flow-recheck-commit');
+    assert.equal((await h.call('POST', endpoint, { stepId: 'commit', attempt: state.steps.commit.attempt + 1 })).status, 409);
+    assert.equal((await h.call('POST', endpoint, { stepId: 'commit', attempt: state.steps.commit.attempt })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal(await git(state.worktree, ['rev-parse', 'HEAD']), head);
+    assert.equal((await h.call('GET', runsPath(pid, id))).json.run.steps.commit.status, 'succeeded');
+  } finally { await h.close(); }
+});
+
+test('API requires review of the current altered commit before accepting it', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const [pid] = h.projectIds;
+  try {
+    const flow = { schema: 1, kind: 'custom', name: 'commit check', git: { mode: 'explicit-step' }, steps: [
+      { id: 'write', title: 'write', type: 'agent', agent: 'codex', access: 'workspace-write', prompt: 'IMPLEMENTER {{task}}', output: { kind: 'text' } },
+      { id: 'commit', title: 'commit', type: 'commit', message: 'save' },
+    ] };
+    const preview = await h.call('POST', `/api/projects/${pid}/flow/start-preview`, { flow });
+    const started = await h.call('POST', runsPath(pid), { task: 'work', flow, confirmedWorkflowHash: preview.json.hash });
+    assert.equal(started.status, 202);
+    const id = started.json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    const file = path.join(repo, '.repobaton', 'runs', id, 'state.json');
+    const state = JSON.parse(await fs.readFile(file, 'utf8'));
+    state.status = 'interrupted';
+    state.steps.commit.status = 'unknown';
+    await fs.writeFile(file, JSON.stringify(state));
+    await fs.writeFile(path.join(state.worktree, 'value.txt'), 'hook changed this\n');
+    await git(state.worktree, ['add', 'value.txt']);
+    await git(state.worktree, ['commit', '--amend', '-q', '--no-edit']);
+    const body = { stepId: 'commit', attempt: state.steps.commit.attempt };
+    const review = await h.call('POST', runsPath(pid, id, '/flow-preview-changed-commit'), body);
+    assert.equal(review.status, 200, JSON.stringify(review.json));
+    assert.match(review.json.diff, /hook changed this/);
+    const accept = runsPath(pid, id, '/flow-accept-changed-commit');
+    assert.equal((await h.call('POST', accept, { ...body, hash: 'stale' })).status, 409);
+    assert.equal((await h.call('POST', accept, { ...body, hash: review.json.hash })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    assert.equal((await h.call('GET', runsPath(pid, id))).json.run.steps.commit.manualCompletion.by, 'user');
+    assert.equal((await git(state.worktree, ['rev-parse', 'HEAD'])).trim(), review.json.head);
+  } finally { await h.close(); }
+});
+
+test('a human-held shared directory stays protected after the server restarts', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rb-flow-takeover-restart-'));
+  const registryFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'rb-home-')), 'projects.json');
+  const first = await harness([dir], { registryFile, serverId: 'first' });
+  let second: Harness | undefined;
+  let firstClosed = false;
+  try {
+    const [pid] = first.projectIds;
+    const flow = { schema: 1, kind: 'custom', name: 'human', git: { mode: 'none' }, steps: [
+      { id: 'confirm', title: 'confirm', type: 'approval', show: [{ kind: 'task' }] },
+      { id: 'write', title: 'write', type: 'agent', agent: 'codex', access: 'workspace-write', prompt: 'IMPLEMENTER {{task}}', output: { kind: 'text' } },
+    ] };
+    const held = (await first.call('POST', runsPath(pid), { task: 'held', flow })).json.id;
+    await waitFor(async () => (await statusOf(first, pid, held)) === 'needs-human' && await idle(first, pid), 45000);
+    const other = (await first.call('POST', runsPath(pid), { task: 'other', flow })).json.id;
+    await waitFor(async () => (await statusOf(first, pid, other)) === 'needs-human' && await idle(first, pid), 45000);
+    const preview = (await first.call('GET', runsPath(pid, other))).json.run.steps.confirm.approvalPreview;
+    assert.equal((await first.call('POST', runsPath(pid, held, '/takeover'), {})).status, 200);
+    await first.close();
+    firstClosed = true;
+    second = await harness([], { registryFile, serverId: 'second' });
+    assert.equal(second.projectIds[0], pid);
+    assert.equal((await second.call('GET', '/api/projects')).json.projects[0].busy, true);
+    assert.equal((await second.call('POST', runsPath(pid, other, '/flow-approve'), { stepId: 'confirm', contentHash: preview.contentHash })).status, 409);
+    assert.equal(second.agent.calls.length, 0);
+    assert.equal((await second.call('POST', runsPath(pid, held, '/return-control'), {})).status, 200);
+    assert.equal((await second.call('POST', runsPath(pid, other, '/flow-approve'), { stepId: 'confirm', contentHash: preview.contentHash })).status, 202);
+    await waitFor(async () => (await statusOf(second!, pid, other)) === 'succeeded' && await idle(second!, pid), 45000);
+  } finally {
+    if (!firstClosed) await first.close();
+    await second?.close();
+  }
+});
+
+test('human commit after an approved built-in run receives a fresh test and review', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const [pid] = h.projectIds;
+  try {
+    const id = (await h.call('POST', runsPath(pid), { task: 'edit' })).json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval' && await idle(h, pid), 45000);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: await planVer(h, pid, id) })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    const before = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal((await h.call('POST', runsPath(pid, id, '/takeover'), {})).status, 200);
+    await fs.writeFile(path.join(before.worktree, 'value.txt'), 'human change\n');
+    await git(before.worktree, ['add', 'value.txt']);
+    await git(before.worktree, ['commit', '-q', '-m', 'human change']);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/return-control'), {})).status, 200);
+    const handed = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(handed.status, 'needs-human');
+    assert.equal(handed.rounds[0].superseded, true);
+    assert.equal(handed.rounds[1].implement.agent, 'human');
+    assert.equal((await h.call('POST', runsPath(pid, id, '/resume'), { expectStatus: 'needs-human' })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    const after = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(after.rounds[1].review.sha, after.rounds[1].implement.sha);
+  } finally { await h.close(); }
+});
+
+test('uncommitted human changes pause a built-in run until committed and re-reviewed', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const [pid] = h.projectIds;
+  try {
+    const id = (await h.call('POST', runsPath(pid), { task: 'edit' })).json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval' && await idle(h, pid), 45000);
+    await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: await planVer(h, pid, id) });
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    const before = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal((await h.call('POST', runsPath(pid, id, '/takeover'), {})).status, 200);
+    await fs.writeFile(path.join(before.worktree, 'value.txt'), 'uncommitted human change\n');
+    assert.equal((await h.call('POST', runsPath(pid, id, '/return-control'), {})).status, 200);
+    const dirty = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(dirty.handoff.reviewRequired, true);
+    assert.match(dirty.handoff.status, /value\.txt/);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/resume'), { expectStatus: dirty.status })).status, 409);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/takeover'), {})).status, 200);
+    await git(before.worktree, ['add', 'value.txt']);
+    await git(before.worktree, ['commit', '-q', '-m', 'human change']);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/return-control'), {})).status, 200);
+    const handed = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(handed.rounds[0].superseded, true);
+    assert.equal(handed.rounds[1].implement.agent, 'human');
+    assert.equal((await h.call('POST', runsPath(pid, id, '/resume'), { expectStatus: 'needs-human' })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+    const after = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.ok(after.rounds[1].test);
+    assert.equal(after.rounds[1].review.sha, after.rounds[1].implement.sha);
+  } finally { await h.close(); }
+});
+
+test('human handoff pauses when the worktree is switched to another branch at the same commit', async () => {
+  const repo = await makeRepo();
+  const h = await harness([repo]);
+  const [pid] = h.projectIds;
+  try {
+    const created = await h.call('POST', runsPath(pid), { task: 'review the plan' });
+    assert.equal(created.status, 202);
+    const id = created.json.id;
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'awaiting-plan-approval' && await idle(h, pid), 45000);
+    const before = (await h.call('GET', runsPath(pid, id))).json.run;
+    const version = before.planVersion;
+    assert.equal((await h.call('POST', runsPath(pid, id, '/takeover'), {})).status, 200);
+    await git(before.worktree, ['checkout', '-q', '-b', 'alternate-same-commit']);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/return-control'), {})).status, 200);
+    const changed = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.equal(changed.handoff.headBefore, changed.handoff.headAfter);
+    assert.equal(changed.handoff.branchBefore, before.branch);
+    assert.equal(changed.handoff.branchAfter, 'alternate-same-commit');
+    assert.equal(changed.handoff.reviewRequired, true);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: version })).status, 409);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/takeover'), {})).status, 200);
+    await git(before.worktree, ['checkout', '-q', before.branch]);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/return-control'), {})).status, 200);
+    const restored = (await h.call('GET', runsPath(pid, id))).json.run;
+    assert.notEqual(restored.handoff.reviewRequired, true);
+    assert.equal((await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: version })).status, 202);
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded' && await idle(h, pid), 45000);
+  } finally { await h.close(); }
 });
 
 test('flow: new task -> waits for approval -> approve -> result', async () => {
@@ -421,7 +920,7 @@ test('flow: reject with feedback re-plans, pauses again, then approve completes'
     assert.equal(mid.rounds.length, 0, 'implementation has not started');
     assert.ok(h.agent.calls.some((c) => c.prompt.includes('add a rollback step')), 'planner saw the feedback');
     await h.call('POST', runsPath(pid, id, '/approve'), { expectPlanVersion: await planVer(h, pid, id) });
-    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded');
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded', 60000);
   } finally {
     await h.close();
   }
@@ -693,7 +1192,7 @@ test('two windows: after plan A is rejected and plan B is pending, the old windo
     // The refreshed window approves B; a double click on B runs exactly once.
     const both = await Promise.all([1, 2, 3].map(() => h.call('POST', runsPath(pid, id, '/approve'), { expectStatus: 'awaiting-plan-approval', expectPlanVersion: versionB })));
     assert.equal(both.filter((r) => r.status === 202).length, 1);
-    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded');
+    await waitFor(async () => (await statusOf(h, pid, id)) === 'succeeded', 60000);
     assert.equal(h.agent.calls.filter((c) => c.prompt.includes('IMPLEMENTER')).length, 1);
   } finally {
     await h.close();
@@ -756,7 +1255,7 @@ test('cleanup shares the repository slot: refused while a replan runs, worktree 
     assert.equal(during.json.error.code, 'busy');
     assert.equal((await h.call('GET', runsPath(pid))).json.runs.find((r: any) => r.id === id).hasWorktree, true, 'worktree untouched');
     gate.release();
-    await waitFor(() => idle(h, pid));
+    await waitFor(() => idle(h, pid), 60000);
     assert.equal((await h.call('POST', runsPath(pid, id, '/cleanup'), {})).status, 200);
   } finally {
     await h.close();
